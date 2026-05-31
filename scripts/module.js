@@ -43,6 +43,18 @@ const MAGICPLUS_VARCOST_WARNING = "variable action cost";
 let _castMessageHookId = null;
 let _renderMessageHookId = null;
 let _origNotifyWarn = null;
+let _varcostWarnWrapper = null;
+// True only during the brief window we're handling a variable-cost essence cast, so the
+// warn override is a no-op (pass-through) at every other time.
+let _suppressVarcostWarn = false;
+
+// Mute Magic+'s variable-cost warning for just the current macrotask. Magic+ fires that
+// warning synchronously right around the cast, in the same macrotask as our handler's
+// synchronous prefix, so clearing on the next tick bounds suppression to that one toast.
+function _muteVarcostWarnBriefly() {
+	_suppressVarcostWarn = true;
+	setTimeout(() => { _suppressVarcostWarn = false; }, 0);
+}
 
 registerTweak({
 	id: "essenceVariableCost",
@@ -59,13 +71,16 @@ registerTweak({
 		if (!_renderMessageHookId) {
 			_renderMessageHookId = Hooks.on("renderChatMessageHTML", _onRenderSpellCard);
 		}
-		// Swallow Magic+'s now-redundant manual-adjust warning.
+		// Swallow Magic+'s now-redundant manual-adjust warning — but only while we're
+		// actively handling a variable-cost cast (gated on _suppressVarcostWarn), so an
+		// unrelated warning that happens to contain the phrase still gets through.
 		if (!_origNotifyWarn && ui.notifications) {
 			_origNotifyWarn = ui.notifications.warn.bind(ui.notifications);
-			ui.notifications.warn = (message, ...rest) => {
-				if (typeof message === "string" && message.includes(MAGICPLUS_VARCOST_WARNING)) return;
+			_varcostWarnWrapper = (message, ...rest) => {
+				if (_suppressVarcostWarn && typeof message === "string" && message.includes(MAGICPLUS_VARCOST_WARNING)) return;
 				return _origNotifyWarn(message, ...rest);
 			};
+			ui.notifications.warn = _varcostWarnWrapper;
 		}
 	},
 	onDisable() {
@@ -77,9 +92,14 @@ registerTweak({
 			Hooks.off("renderChatMessageHTML", _renderMessageHookId);
 			_renderMessageHookId = null;
 		}
+		// Restore only if we're still the active wrapper — if another module wrapped warn
+		// on top of ours, leave its wrapper in place rather than clobbering it.
 		if (_origNotifyWarn && ui.notifications) {
-			ui.notifications.warn = _origNotifyWarn;
+			if (ui.notifications.warn === _varcostWarnWrapper) {
+				ui.notifications.warn = _origNotifyWarn;
+			}
 			_origNotifyWarn = null;
+			_varcostWarnWrapper = null;
 		}
 	}
 });
@@ -112,10 +132,6 @@ async function _onSpellCardCreated(message) {
 	const actor = message.actor;
 	if (!actor?.spellcasting) return;
 
-	// Essence draws only happen in combat — out of combat, casts go through
-	// Incantations (which don't draw the pool), so don't prompt there.
-	if (!_actorInCombat(actor)) return;
-
 	const entry = actor.spellcasting.get(castingId);
 	if (!entry) return;
 
@@ -123,6 +139,16 @@ async function _onSpellCardCreated(message) {
 	// which is exactly how Magic+'s toggle marks an entry as essence-casting).
 	const rules = entry.system?.rules ?? [];
 	if (!rules.some(r => r.value === "essence")) return;
+
+	// This is a variable-cost essence cast — exactly the case Magic+ can't resolve, so
+	// it fires its "manually adjust ... variable action cost" toast. Briefly mute just
+	// that warning (auto-clears next macrotask) rather than overriding warn permanently.
+	// Done before the combat gate so it covers out-of-combat casts too.
+	_muteVarcostWarnBriefly();
+
+	// Essence draws only happen in combat — out of combat, casts go through
+	// Incantations (which don't draw the pool), so don't prompt there.
+	if (!_actorInCombat(actor)) return;
 
 	const pool = actor.getResource("essence-pool");
 	if (!pool) return;
@@ -140,9 +166,9 @@ async function _onSpellCardCreated(message) {
 	// can trigger Terminus). Handle both here.
 	if (rollOptions.includes(BOUNDED_CASTER_OPTION)) {
 		if (isCantrip) {
-			await _handleBoundedVariableCantrip(message, spell, actor, pool);
+			await _handleBoundedVariableCantrip(message, spell, actor, pool, range);
 		} else {
-			await _handleBoundedVariableSpell(message, spell, actor, pool, rollOptions);
+			await _handleBoundedVariableSpell(message, spell, actor, pool, rollOptions, range);
 		}
 		return;
 	}
@@ -154,11 +180,11 @@ async function _onSpellCardCreated(message) {
 	// (its `"2"!==time && "3"!==time` gate), so a variable-cost cantrip never updates
 	// the pool — handle it here, mirroring Magic+'s full-caster cantrip path.
 	if (isCantrip) {
-		await _handleVariableCantrip(message, spell, actor, pool, cycleTerminus);
+		await _handleVariableCantrip(message, spell, actor, pool, cycleTerminus, range);
 		return;
 	}
 
-	const leak = await _promptLeakOrDraw(spell);
+	const leak = await _promptLeakOrDraw(spell, range);
 	if (leak == null) return; // Cancelled — leave the pool as-is.
 
 	const wasAtMax = pool.value === pool.max;
@@ -194,8 +220,8 @@ async function _onSpellCardCreated(message) {
 // the pool to your essence draw (or +1 if already at/above it); 1 action has no essence
 // effect. Drawing past max with cycle-terminus prompts a confirm, exactly as Magic+ does
 // for fixed-cost cantrips. Magic+ math: `i = draw > pool ? draw : pool + 1`.
-async function _handleVariableCantrip(message, spell, actor, pool, cycleTerminus) {
-	const drew = await _promptCantripActions(spell);
+async function _handleVariableCantrip(message, spell, actor, pool, cycleTerminus, range) {
+	const drew = await _promptCantripActions(spell, range);
 	if (drew == null) return; // Cancelled — leave the pool as-is.
 	if (!drew) return; // 1 action — a cantrip doesn't draw or leak.
 
@@ -226,8 +252,8 @@ async function _handleVariableCantrip(message, spell, actor, pool, cycleTerminus
 // branch). 1 action does nothing. Bounded cantrips don't advance the stage or trigger
 // Terminus, so neither do we. If the caster has leaked this encounter, the shared
 // updateResource wrapper still applies its −1 to this draw (the Second Draw correction).
-async function _handleBoundedVariableCantrip(message, spell, actor, pool) {
-	const drew = await _promptCantripActions(spell);
+async function _handleBoundedVariableCantrip(message, spell, actor, pool, range) {
+	const drew = await _promptCantripActions(spell, range);
 	if (drew == null) return; // Cancelled — leave the pool as-is.
 	if (!drew) return; // 1 action — a cantrip doesn't draw or leak.
 
@@ -247,9 +273,9 @@ async function _handleBoundedVariableCantrip(message, spell, actor, pool) {
 // Draw with a full pool, triggering Terminus. We prompt for the real action count and, on a
 // 1-action cast, mark the leak (so the Second Draw correction fires) and undo any Terminus
 // Magic+ wrongly granted. 2+ actions is a clean advance, which is what Magic+ already did.
-async function _handleBoundedVariableSpell(message, spell, actor, pool, rollOptions) {
+async function _handleBoundedVariableSpell(message, spell, actor, pool, rollOptions, range) {
 	const preStage2 = rollOptions.includes(`${BOUNDED_TIME_OPTION}:2`);
-	const leak = await _promptLeakOrDraw(spell);
+	const leak = await _promptLeakOrDraw(spell, range);
 	if (leak == null) return; // Cancelled — leave Magic+'s default (clean advance).
 
 	if (!leak) {
@@ -475,8 +501,10 @@ function _findTerminusFeat(actor) {
 }
 
 // Returns true to leak (1 action), false to draw (2+ actions), or null if the
-// dialog was dismissed.
-async function _promptLeakOrDraw(spell) {
+// dialog was dismissed. A spell whose minimum cost is 2+ actions can never be a
+// 1-action leak, so we skip the prompt and report a draw.
+async function _promptLeakOrDraw(spell, range) {
+	if (range && range.min >= 2) return false;
 	try {
 		const result = await foundry.applications.api.DialogV2.wait({
 			window: { title: "Essence Casting — Actions Spent" },
@@ -499,8 +527,10 @@ async function _promptLeakOrDraw(spell) {
 }
 
 // Returns true if the cantrip was cast with 2+ actions (draw), false for 1 action (no
-// essence effect — cantrips don't leak), or null if the dialog was dismissed.
-async function _promptCantripActions(spell) {
+// essence effect — cantrips don't leak), or null if the dialog was dismissed. A cantrip
+// whose minimum cost is 2+ actions always draws, so we skip the prompt.
+async function _promptCantripActions(spell, range) {
+	if (range && range.min >= 2) return true;
 	try {
 		const result = await foundry.applications.api.DialogV2.wait({
 			window: { title: "Essence Casting — Actions Spent" },
@@ -783,7 +813,15 @@ let _combatOnlyActive = false;
 let _leakActive = false;
 
 function _registerUpdateResourceWrapper() {
-	if (_updateResourceRefcount === 0 && typeof libWrapper === "function") {
+	if (typeof libWrapper !== "function") {
+		// Without libWrapper the essence-pool wrapper can't install, so "Essence Pool:
+		// Combat-Only" and "Bounded Second Draw Leak" would silently do nothing. Surface
+		// it loudly instead of failing quietly. (module.json also declares the dependency.)
+		console.error(`${MODULE_ID} | libWrapper is not active — the Essence Pool tweaks (Combat-Only / Second Draw Leak) cannot function. Install and enable the libWrapper module.`);
+		ui.notifications?.error("Sky's 2e Tweaks: the libWrapper module is required for the Essence Pool tweaks but isn't active.");
+		return;
+	}
+	if (_updateResourceRefcount === 0) {
 		libWrapper.register(MODULE_ID, UPDATE_RESOURCE_TARGET, _wrapUpdateResource, "WRAPPER");
 	}
 	_updateResourceRefcount++;
@@ -1340,7 +1378,8 @@ const REFOCUS_MACRO_IMG = "icons/magic/light/explosion-star-glow-blue.webp";
 // Standalone hotbar-macro body. Unlike the sheet button (which knows its actor), a
 // hotbar macro has no sheet context, so it acts on the selected token(s). Kept in
 // sync with _doRefocus by hand — same three steps plus a chat line.
-const REFOCUS_MACRO_SOURCE = `const actors = game.user.getActiveTokens().flatMap((t) => t.actor ?? []);
+const REFOCUS_MACRO_SOURCE = `const _seen = new Set();
+const actors = game.user.getActiveTokens().flatMap((t) => t.actor ?? []).filter((a) => a && !_seen.has(a.id) && _seen.add(a.id));
 if (actors.length === 0) {
     return ui.notifications.error("PF2E.ErrorMessage.NoTokenSelected", { localize: true });
 }
@@ -1816,15 +1855,21 @@ async function _tcApplyToToken(condition, token, btn) {
 			return;
 		}
 
-		const itemData = item.toObject();
+		const slug = item.slug ?? item.system?.slug;
+		if (!slug) {
+			ui.notifications.warn(`No condition slug for: ${condition.name}`);
+			btn.disabled = false;
+			return;
+		}
 
 		// Parse trailing number from display name, e.g. "Frightened 2" → value 2.
 		const valueMatch = condition.name.match(/\s(\d+)$/);
-		if (valueMatch && itemData.system?.value?.value !== undefined) {
-			itemData.system.value.value = parseInt(valueMatch[1]);
-		}
+		const value = valueMatch ? parseInt(valueMatch[1]) : undefined;
 
-		await token.actor.createEmbeddedDocuments("Item", [itemData]);
+		// Use the system condition API rather than cloning the item: increaseCondition
+		// takes the MAX of the existing and applied value (two "Frightened 1"s stay
+		// Frightened 1 — no summing) and never stacks a duplicate condition document.
+		await token.actor.increaseCondition(slug, value !== undefined ? { value } : undefined);
 
 		btn.classList.add("applied");
 		btn.innerHTML = `<i class="fa-solid fa-check"></i> ${condition.name}`;
