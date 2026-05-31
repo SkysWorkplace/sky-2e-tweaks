@@ -708,6 +708,57 @@ function _onRenderCharacterSheet(sheet, html) {
 	_spellTabHeader(collections).prepend(label);
 }
 
+// =============================================================================
+// Tweak: Essence Draw indicator
+//
+// Surfaces the caster's current Essence Draw (flags.pf2e.essence-draw — the live
+// remaining draw after any Maintaining Incantations stacks) in the spellcasting tab
+// header, beside the Incantation toggle, so they can see at a glance how much draw is
+// left before essence casting cuts off. Pure DOM in renderCharacterSheetPF2e.
+// =============================================================================
+
+let _essenceDrawSheetHookId = null;
+
+registerTweak({
+	id: "essenceDrawIndicator",
+	name: "Essence Draw Indicator",
+	hint: "Shows your current Essence Draw in the spellcasting tab header for essence casters. When incantations are being maintained it reads remaining / base, so you can see how much draw is left before essence casting cuts off.",
+	default: true,
+	onEnable() {
+		if (!_essenceDrawSheetHookId) {
+			_essenceDrawSheetHookId = Hooks.on("renderCharacterSheetPF2e", _onRenderEssenceDraw);
+		}
+	},
+	onDisable() {
+		if (_essenceDrawSheetHookId) {
+			Hooks.off("renderCharacterSheetPF2e", _essenceDrawSheetHookId);
+			_essenceDrawSheetHookId = null;
+		}
+	}
+});
+
+function _onRenderEssenceDraw(sheet, html) {
+	const actor = sheet.actor;
+	if (!actor?.getRollOptions().includes("feature:essence-pool")) return;
+
+	const root = sheet.element?.[0] ?? sheet.element ?? (html instanceof HTMLElement ? html : html?.[0]);
+	const collections = root?.querySelector?.('.tab.spellcasting .spell-collections');
+	if (!collections || collections.querySelector(".sky-essence-draw")) return;
+
+	const draw = Number(actor.flags?.pf2e?.["essence-draw"]) || 0;
+
+	const span = document.createElement("span");
+	span.className = "sky-essence-draw";
+	span.dataset.tooltip = `Essence Draw: ${draw}. At 0 you can't cast essence spells until you Refocus.`;
+	span.innerHTML = `<i class="fa-solid fa-fw fa-droplet"></i> Draw ${draw}`;
+
+	// Sit just after the Incantation toggle when present, else lead the header.
+	const header = _spellTabHeader(collections);
+	const toggle = header.querySelector(".sky-incantation-toggle");
+	if (toggle) toggle.after(span);
+	else header.prepend(span);
+}
+
 // On an out-of-combat essence cast while Incantation Mode is on, apply or advance
 // the Maintaining Incantations effect. Pool changes are left to Magic+.
 async function _onIncantationCast(message) {
@@ -730,6 +781,20 @@ async function _onIncantationCast(message) {
 	const entry = actor.spellcasting?.get(castingId);
 	const rules = entry?.system?.rules ?? [];
 	if (!rules.some(r => r.value === "essence")) return;
+
+	// Once your essence draw is spent you can't cast essence spells at all (Incantations
+	// feat: "if that would reduce your essence draw to 0, you can't draw essence or cast
+	// essence spells"). Each maintained incantation reduces essence draw by 1 via Magic+'s
+	// "Maintaining Incantations" effect (an AELike on flags.pf2e.essence-draw), so the flag
+	// is already the live remaining capacity. Block at 0 — checked before the Mastery branch
+	// since even a free incantation can't be cast at 0 draw. The spell card has already been
+	// posted by the time this hook fires, so this is a reactive refusal-to-maintain + warn;
+	// we can't un-cast the spell itself.
+	const remainingDraw = Number(actor.flags?.pf2e?.["essence-draw"]) || 0;
+	if (remainingDraw <= 0) {
+		ui.notifications.warn(`${actor.name} has no essence draw remaining — incantations can't be maintained until they Refocus.`);
+		return;
+	}
 
 	// Incantation Mastery: a low-rank, durationless incantation is free — skip the bump.
 	if (_incantationMasteryFree(actor, spell, message)) return;
@@ -881,20 +946,39 @@ registerTweak({
 	}
 });
 
-// On combat start, fill each Initial Draw combatant's Essence Pool up to their essence
-// draw (flags.pf2e.essence-draw). GM-only; never lowers a pool that's already higher.
-// `started` is true by the time combatStart fires, so the combat-only block allows it.
+// On combat start, settle every essence caster's "draw" state:
+//   draw > 0  -> fill each Initial Draw combatant's Essence Pool up to their draw.
+//   draw <= 0 -> the caster is out of essence: force the bounded-time toggle to 0 (so
+//                `essence-blocked` applies and the cast machinery is short-circuited — no
+//                phantom +1 advance) and cross out the ranked slots so they read as spent
+//                on turn 1. Magic+ only re-evaluates the cross-out on a pool change, and at
+//                draw 0 the pool never moves, so we have to drive both ourselves.
+// GM-only; never lowers a pool that's already higher. `started` is true by the time
+// combatStart fires, so the combat-only block allows the Initial Draw fill.
 function _onCombatStartDraw(combat) {
 	if (!game.user.isGM) return;
 	for (const combatant of combat.combatants) {
 		const actor = combatant.actor;
-		if (!actor) continue;
+		if (!actor?.getRollOptions?.().includes("feature:essence-pool")) continue;
+		const draw = Number(actor.flags?.pf2e?.["essence-draw"]) || 0;
+
+		if (draw <= 0) {
+			// Out of essence. Drop the bounded-time stage to 0 for casters that actually
+			// have the toggle (basic, bounded, sub-level-3 full) so essence-blocked engages;
+			// full casters level 3+ have no such toggle, but the updateResource wrapper
+			// still blocks their advance. Then force the ranked-slot cross-out.
+			const opts = actor.getRollOptions();
+			if (opts.some(o => o.startsWith(`${BOUNDED_TIME_OPTION}:`)) && !opts.includes(`${BOUNDED_TIME_OPTION}:0`)) {
+				actor.toggleRollOption("all", BOUNDED_TIME_OPTION, null, true, "0");
+			}
+			_crossOutEssenceSlots(actor);
+			continue;
+		}
+
 		const hasInitialDraw = actor.items?.some?.(
 			i => i.sourceId === INITIAL_DRAW_UUID || i.name === INITIAL_DRAW_NAME
 		);
 		if (!hasInitialDraw) continue;
-		const draw = Number(actor.flags?.pf2e?.["essence-draw"]) || 0;
-		if (draw <= 0) continue;
 		const pool = actor.getResource?.(ESSENCE_POOL_SLUG);
 		if (!pool || pool.value >= draw) continue;
 		actor.updateResource(ESSENCE_POOL_SLUG, draw, { render: true, [INITIAL_DRAW_OPTION]: true });
@@ -921,13 +1005,19 @@ function _wrapUpdateResource(wrapped, resource, value, options) {
 	}
 
 	// --- Combat-only block ---
-	// Block Essence Pool increases while the actor is out of combat. Decreases (e.g. a
-	// leak back to 0) and every in-combat change pass through untouched.
+	// Block Essence Pool increases while the actor is out of combat, OR while in combat
+	// but out of essence (draw <= 0). The latter stops the castWrapper +1 advance that
+	// every caster type (including full casters level 3+, which have no bounded-time
+	// toggle to gate via essence-blocked) would otherwise get when casting at draw 0.
+	// Decreases (e.g. a leak back to 0) always pass through untouched.
 	if (_combatOnlyActive) {
 		if (options?.[INITIAL_DRAW_OPTION]) return wrapped(resource, value, options);
-		if (isEssencePool && !_actorInCombat(this)) {
+		if (isEssencePool && typeof value === "number") {
 			const current = this.getResource?.(ESSENCE_POOL_SLUG)?.value ?? 0;
-			if (value > current) return wrapped(resource, current, options);
+			if (value > current) {
+				const draw = Number(this.flags?.pf2e?.["essence-draw"]) || 0;
+				if (!_actorInCombat(this) || draw <= 0) return wrapped(resource, current, options);
+			}
 		}
 	}
 	return wrapped(resource, value, options);
@@ -982,6 +1072,43 @@ function _restoreEssenceSlots(actor, { force = false } = {}) {
 			} else if (entry.isSpontaneous) {
 				if (force || (slotData.value ?? 0) < slotData.max) {
 					obj[`system.slots.${slot}.value`] = slotData.max;
+					touched = true;
+				}
+			}
+		}
+		if (touched) updates.push(obj);
+	}
+	if (updates.length) actor.updateEmbeddedDocuments("Item", updates);
+}
+
+// Inverse of `_restoreEssenceSlots`: cross out (expend) every ranked essence slot the
+// pool can't currently afford, mirroring Magic+'s `updateEssencePool` expend pass
+// (`expended = pool.value < rank`). We need our own copy because Magic+ only re-runs that
+// pass on a pool *change* — at draw 0 the pool never moves off 0 at combat start, so the
+// out-of-combat "everything available" state would otherwise persist into turn 1. GM-only;
+// writes to entry items (not the pool), and is idempotent (already-expended slots produce
+// no diff), so it converges and can't loop.
+function _crossOutEssenceSlots(actor) {
+	if (!game.user.isGM || !actor) return;
+	const poolValue = actor.getResource?.(ESSENCE_POOL_SLUG)?.value ?? 0;
+	const updates = [];
+	for (const entry of _essenceEntries(actor)) {
+		const obj = { _id: entry.id };
+		let touched = false;
+		for (const slot in entry.system.slots) {
+			const rank = Number(slot.replace("slot", ""));
+			if (rank === 0) continue;
+			if (poolValue >= rank) continue; // affordable — leave it as-is
+			const slotData = entry.system.slots[slot];
+			if (entry.isPrepared) {
+				const prepared = slotData.prepared ?? [];
+				if (prepared.some(x => !x.expended)) {
+					obj[`system.slots.${slot}.prepared`] = prepared.map(x => ({ ...x, expended: true }));
+					touched = true;
+				}
+			} else if (entry.isSpontaneous) {
+				if ((slotData.value ?? 0) > 0) {
+					obj[`system.slots.${slot}.value`] = 0;
 					touched = true;
 				}
 			}
@@ -1058,14 +1185,25 @@ function _onBoundedCombatEnd(combat) {
 // GM-only: set each Bounded essence caster combatant's bounded-time stage, skipping
 // any already on that stage. Mirrors Magic+'s own toggle call
 // (`toggleRollOption("all", "bounded-time", null, true, n)`).
+//
+// A caster with no essence draw (flags.pf2e.essence-draw <= 0) must NOT be advanced
+// into a draw stage at combat start: arming 1st Draw would both suppress the
+// `essence-blocked` cross-out (it's gated on bounded-time:0) and hand them a draw they
+// can't actually make. For those casters we force stage 0 (Out of Essence) instead, so
+// their spells cross out on turn 1 and no phantom draw is granted.
 function _setBoundedStageForCombat(combat, stage) {
 	if (!game.user.isGM) return;
 	for (const combatant of combat.combatants) {
 		const actor = combatant.actor;
 		const opts = actor?.getRollOptions?.();
 		if (!opts?.includes(BOUNDED_CASTER_OPTION)) continue;
-		if (opts.includes(`${BOUNDED_TIME_OPTION}:${stage}`)) continue;
-		actor.toggleRollOption("all", BOUNDED_TIME_OPTION, null, true, stage);
+		let target = stage;
+		if (target !== "0") {
+			const draw = Number(actor.flags?.pf2e?.["essence-draw"]) || 0;
+			if (draw <= 0) target = "0";
+		}
+		if (opts.includes(`${BOUNDED_TIME_OPTION}:${target}`)) continue;
+		actor.toggleRollOption("all", BOUNDED_TIME_OPTION, null, true, target);
 	}
 }
 
@@ -1884,69 +2022,179 @@ async function _tcApplyToToken(condition, token, btn) {
 // =============================================================================
 // Tweak: Life Essence max-rank auto-update
 //
-// Magic+ computes flags.pf2e.maxhealingRank (the Life Essence Reservoir's max =
-// maxhealingRank * healerAdjustment) from the highest-rank non-cantrip healing/harm
-// spell in your essence entries — but ONLY on `updateItem` (when you edit a spell or
-// entry). It never refreshes on a fresh load, a level-up, or just opening the sheet,
-// so the flag goes stale and you end up editing it by hand. This tweak re-runs Magic+'s
-// exact computation as a `renderCharacterSheetPF2e` backstop: idempotent (writes only
-// when the computed rank differs from the stored flag), owner-gated, so it self-corrects
-// without manual edits and without a render loop.
+// Magic+ drives the Life Essence Reservoir's max (= flags.pf2e.maxhealingRank *
+// healerAdjustment) but only refreshes maxhealingRank on `updateItem` (editing an existing
+// spell), so gaining a spell on level-up or a fresh page load leaves it stale — and it
+// scans only *healing* spells, which misbehaved. HOUSERULE: rather than fight over that
+// flag (which caused a per-cast "blink"; see _ensureReservoirMax), we leave maxhealingRank
+// to Magic+ and instead bake the highest spell-SLOT rank the entry actually has (see
+// _computeMaxHealingRank) straight into the reservoir feat's SpecialResource max. We
+// recompute on a debounced pass triggered by actor level change, spellcasting-entry
+// create/update, and a one-time load pass, and also resolve the basic essence caster's
+// gated ChoiceSet so their resource renders (see _ensureReservoirMax).
+//
+// IMPORTANT: the recompute writes a document (item.update on the feat's rules), so it must
+// NEVER run inside a render hook or synchronously inside the flurry of changes a level-up
+// fires — a re-entrant write during PF2e's grant transaction DUPLICATES granted feats and
+// spins the sheet (this is exactly the bug an earlier render-hook version caused). We
+// debounce per actor so the single write lands only after the storm settles.
 // =============================================================================
 
-let _maxRankSheetHookId = null;
+let _maxRankUpdateActorHookId = null;
+let _maxRankEntryCreateHookId = null;
+let _maxRankEntryUpdateHookId = null;
+let _maxRankReadyHookId = null;
+// actorId -> pending setTimeout handle.
+const _maxRankTimers = new Map();
 
-// Returns the computed max healing rank, or null when the actor isn't an essence caster
-// (so the caller can skip). Mirrors Magic+'s updateLifeEssence updateItem logic.
+// True when the actor is a *basic* essence caster (Wizard-Dedication-style limited variant).
+// Their spellcasting entry isn't flagged pf2e-team-plus-magic.essence like full/bounded
+// entries, so detect via the roll option (no-domain -> "all") with a feat-slug fallback.
+function _isBasicEssence(actor) {
+	if (actor?.flags?.pf2e?.rollOptions?.all?.["essence-caster:basic"]) return true;
+	if (actor?.rollOptions?.all?.["essence-caster:basic"]) return true;
+	return actor?.itemTypes?.feat?.some(f => f.slug === "basic-essence-spellcasting") ?? false;
+}
+
+// Returns the computed max rank, or null when the actor isn't an essence caster (so the
+// caller can skip). HOUSERULE: the Reservoir max tracks the highest SPELL-SLOT RANK the
+// entry actually has slots for — i.e. the top rank N where slotN.max > 0 (cantrips/slot0
+// excluded). We scan the real slots rather than entry.highestRank (which reports the
+// theoretical max for the caster's level and so over-counts archetype casters, who gain
+// ranks far slower than ceil(level/2)). Independent of which spells are prepared/known.
 async function _computeMaxHealingRank(actor) {
 	if (!actor?.spellcasting) return null;
-	const entries = actor.spellcasting.regular.filter(x => x?.flags?.[MAGICPLUS_ID]?.essence);
+	const regular = actor.spellcasting.regular ?? [];
+	let entries = regular.filter(x => x?.flags?.[MAGICPLUS_ID]?.essence);
+	// Basic casters' dedication entry isn't flagged essence — fall back to all regular entries.
+	if (!entries.length && _isBasicEssence(actor)) entries = [...regular];
 	if (!entries.length) return null;
 
 	let rank = 0;
 	for (const entry of entries) {
-		const sheetData = await entry.getSheetData();
-		const slotSpells = (sheetData.groups ?? [])
-			.flatMap(g => g.active)
-			.filter(x => x && !x.spell?.traits?.has?.("cantrip"));
-		for (const meta of slotSpells) {
-			const isHealing = meta?.spell?.traits?.has?.("healing");
-			const isSpecific = meta?.spell?.slug === "harm";
-			if (isHealing || isSpecific) rank = Math.max(rank, meta?.castRank || meta?.spell?.rank || 0);
+		const slots = entry.system?.slots ?? {};
+		for (const [key, slot] of Object.entries(slots)) {
+			if ((slot?.max ?? 0) <= 0) continue;
+			const n = Number(key.replace("slot", "")) || 0; // slot0 = cantrips -> 0, excluded
+			if (n > rank) rank = n;
 		}
 	}
 	return rank;
 }
 
-async function _onRenderMaxHealingRank(sheet) {
-	const actor = sheet?.actor;
-	// Only an owner can write the flag; non-owner renders no-op.
+// HOUSERULE / DECOUPLE: Magic+'s Life Essence Reservoir SpecialResource max is
+// `@actor.flags.pf2e.maxhealingRank * @item...healerAdjustment`, and Magic+'s own updateItem
+// handler rewrites flags.pf2e.maxhealingRank (from your highest *healing* spell, no
+// idempotency guard) on every spell-entry change — including casting, which consumes a slot.
+// While we also wrote maxhealingRank (our slot-based value), the two disagreed and the
+// reservoir "blinked" between sizes on every cast (Magic+ writes its value -> render, we
+// write ours back -> render). Fix: we no longer write maxhealingRank at all (so Magic+ owns
+// it and its repeated same-value writes are no-op diffs), and instead bake our slot-based
+// rank straight into the reservoir feat's SpecialResource max as a literal, keeping the
+// healerAdjustment multiplier dynamic via the flag. The reservoir then ignores maxhealingRank
+// entirely and only changes when our slot rank does.
+//
+// Additionally for *basic* essence casters: Magic+ gates the healerAdjustment ChoiceSet off
+// (predicate {not: "essence-caster:basic"}), so it's ignored and never resolves — which
+// leaves the SpecialResource unresolved and the resource never renders. We resolve it by
+// removing the predicate and baking in selection 12 (the "None" baseline) so it resolves
+// silently. Idempotent (skips when already correct) and one-time (a feat rules update fires
+// no hook that re-schedules us), so it never loops.
+async function _ensureReservoirMax(actor) {
 	if (!actor?.isOwner) return;
-
 	const rank = await _computeMaxHealingRank(actor);
 	if (rank === null) return; // not an essence caster
 
-	const current = actor.flags?.pf2e?.maxhealingRank ?? 0;
-	if (rank === current) return; // idempotent — the re-render this triggers will no-op
+	const feat = actor.itemTypes?.feat?.find(f =>
+		(f._source?.system?.rules ?? []).some(r => r.key === "SpecialResource" && r.slug === "life-essence"));
+	if (!feat) return;
 
-	await actor.update({ "flags.pf2e.maxhealingRank": rank });
+	const rules = foundry.utils.deepClone(feat._source.system.rules);
+	const sr = rules.find(r => r.key === "SpecialResource" && r.slug === "life-essence");
+	const cs = rules.find(r => r.key === "ChoiceSet" && r.flag === "healerAdjustment");
+	if (!sr) return;
+
+	let changed = false;
+
+	// Slot-based rank as a literal; healerAdjustment stays dynamic (respects the player's
+	// None/Healer/Grand Healer pick, and the basic-caster selection we force below).
+	const desiredMax = `${rank} * @item.flags.pf2e.rulesSelections.healerAdjustment`;
+	if (sr.max !== desiredMax) { sr.max = desiredMax; changed = true; }
+
+	// Basic casters: resolve the otherwise-skipped ChoiceSet so the resource renders.
+	if (_isBasicEssence(actor) && cs) {
+		if (cs.predicate !== undefined) { delete cs.predicate; changed = true; }
+		if (cs.selection !== 12) { cs.selection = 12; changed = true; }
+	}
+
+	if (!changed) return; // already houseruled — no write, no loop
+	await feat.update({ "system.rules": rules });
+}
+
+// Runs the full reservoir refresh for an actor.
+async function _refreshReservoir(actor) {
+	await _ensureReservoirMax(actor);
+}
+
+// Debounces the write per actor (300ms) so a level-up's flurry of item changes
+// collapses into a single update that lands AFTER the grant transaction settles —
+// never re-entrant, so it can't duplicate granted feats or spin the sheet.
+function _scheduleMaxHealingRank(actor) {
+	if (!actor?.id || !actor.isOwner) return;
+	const prev = _maxRankTimers.get(actor.id);
+	if (prev) clearTimeout(prev);
+	_maxRankTimers.set(actor.id, setTimeout(() => {
+		_maxRankTimers.delete(actor.id);
+		_refreshReservoir(actor);
+	}, 300));
+}
+
+function _onUpdateActorMaxRank(actor, changes) {
+	if (actor?.type !== "character") return;
+	// Only react when level actually changed; ignore unrelated actor updates
+	// (including our own maxhealingRank write, which the idempotent guard also catches).
+	if (changes?.system?.details?.level?.value === undefined) return;
+	_scheduleMaxHealingRank(actor);
+}
+
+// Fires when a spellcasting entry is created or its slots/proficiency change — covers a
+// brand-new caster (or one gaining an archetype dedication) where level never changes, so
+// the updateActor trigger and a prior ready pass would both miss it.
+function _onEntryChangeMaxRank(item) {
+	if (item?.type !== "spellcastingEntry") return;
+	const actor = item.actor;
+	if (actor?.type !== "character") return;
+	_scheduleMaxHealingRank(actor);
+}
+
+// One-time pass on load so fresh page loads (where nothing changed) aren't stale.
+function _onReadyMaxRank() {
+	for (const actor of game.actors ?? []) {
+		if (actor?.type !== "character" || !actor.isOwner) continue;
+		const hasEssence = actor.spellcasting?.regular?.some(x => x?.flags?.[MAGICPLUS_ID]?.essence);
+		if (hasEssence || _isBasicEssence(actor)) _scheduleMaxHealingRank(actor);
+	}
 }
 
 registerTweak({
 	id: "lifeEssenceMaxRank",
 	name: "Life Essence Max Rank Auto-Update",
-	hint: "Keeps flags.pf2e.maxhealingRank (the Life Essence Reservoir's max) current by recomputing it from your highest healing/harm spell whenever the sheet renders — Magic+ only refreshes it when you edit your spell list, so it otherwise goes stale.",
+	hint: "Keeps the Life Essence Reservoir's max current. Houserule: the reservoir is sized from the highest spell-slot rank your essence entry actually has (times your healer adjustment), recomputed on level change, spell-entry changes, and a one-time load pass — so it climbs (or drops) with your slots and is otherwise left alone. Decoupled from Magic+'s maxhealingRank flag to stop the per-cast reservoir blink, and also enables the reservoir for basic essence casters.",
 	default: true,
 	onEnable() {
-		if (!_maxRankSheetHookId) {
-			_maxRankSheetHookId = Hooks.on("renderCharacterSheetPF2e", _onRenderMaxHealingRank);
-		}
+		if (!_maxRankUpdateActorHookId) _maxRankUpdateActorHookId = Hooks.on("updateActor", _onUpdateActorMaxRank);
+		if (!_maxRankEntryCreateHookId) _maxRankEntryCreateHookId = Hooks.on("createItem", _onEntryChangeMaxRank);
+		if (!_maxRankEntryUpdateHookId) _maxRankEntryUpdateHookId = Hooks.on("updateItem", _onEntryChangeMaxRank);
+		if (game.ready) _onReadyMaxRank();
+		else if (!_maxRankReadyHookId) _maxRankReadyHookId = Hooks.once("ready", _onReadyMaxRank);
 	},
 	onDisable() {
-		if (_maxRankSheetHookId) {
-			Hooks.off("renderCharacterSheetPF2e", _maxRankSheetHookId);
-			_maxRankSheetHookId = null;
-		}
+		if (_maxRankUpdateActorHookId) { Hooks.off("updateActor", _maxRankUpdateActorHookId); _maxRankUpdateActorHookId = null; }
+		if (_maxRankEntryCreateHookId) { Hooks.off("createItem", _maxRankEntryCreateHookId); _maxRankEntryCreateHookId = null; }
+		if (_maxRankEntryUpdateHookId) { Hooks.off("updateItem", _maxRankEntryUpdateHookId); _maxRankEntryUpdateHookId = null; }
+		if (_maxRankReadyHookId) { Hooks.off("ready", _maxRankReadyHookId); _maxRankReadyHookId = null; }
+		for (const handle of _maxRankTimers.values()) clearTimeout(handle);
+		_maxRankTimers.clear();
 	}
 });
 

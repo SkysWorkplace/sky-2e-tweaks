@@ -88,6 +88,17 @@
 	cursor: pointer;
 }
 
+/* Current Essence Draw indicator in the spellcasting tab header. */
+.sky-essence-draw {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 0.9em;
+	font-weight: 600;
+	opacity: 0.85;
+	white-space: nowrap;
+}
+
 /* Refocus button at the top of the spellcasting tab — blue with white text, styled
    after the PF2e spell-preparation button. margin-left:auto pushes it to the right
    edge of the shared header (and keeps it right when the toggle isn't present). */

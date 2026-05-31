@@ -2,7 +2,7 @@
 	"id": "sky-2e-tweaks",
 	"title": "Sky's 2e Tweaks",
 	"description": "A collection of small QoL tweaks and fixes for Pathfinder 2e, including Magic+ Essence Casting automation fixes.",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"authors": [
 		{
 			"name": "Sky"
@@ -10,7 +10,7 @@
 	],
 	"url": "https://github.com/SkysWorkplace/sky-2e-tweaks",
 	"manifest": "https://raw.githubusercontent.com/SkysWorkplace/sky-2e-tweaks/main/module.json",
-	"download": "https://github.com/SkysWorkplace/sky-2e-tweaks/releases/download/v1.0.1/sky-2e-tweaks-v1.0.1.zip",
+	"download": "https://github.com/SkysWorkplace/sky-2e-tweaks/releases/download/v1.0.2/sky-2e-tweaks-v1.0.2.zip",
 	"bugs": "https://github.com/SkysWorkplace/sky-2e-tweaks/issues",
 	"compatibility": {
 		"minimum": "13",
