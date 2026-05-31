@@ -1,0 +1,250 @@
+.sky-tweaks-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.sky-tweak-row {
+	display: flex;
+	align-items: flex-start;
+	gap: 10px;
+	padding: 6px 4px;
+	border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+.sky-tweak-row:last-child {
+	border-bottom: none;
+}
+
+.sky-tweak-toggle {
+	flex: 0 0 auto;
+	padding-top: 2px;
+}
+
+.sky-tweak-info {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	cursor: pointer;
+}
+
+.sky-tweak-name {
+	font-weight: bold;
+	font-size: 13px;
+}
+
+.sky-tweak-hint {
+	font-size: 11px;
+	opacity: 0.7;
+	margin-top: 2px;
+}
+
+.sky-tweaks-empty {
+	font-style: italic;
+	opacity: 0.6;
+	text-align: center;
+}
+
+.sky-tweaks-footer {
+	display: flex;
+	justify-content: flex-end;
+	margin-top: 10px;
+	padding-top: 8px;
+	border-top: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+.sky-tweaks-footer button {
+	width: auto;
+	flex: 0 0 auto;
+	padding: 4px 14px;
+}
+
+.sky-essence-prompt .sky-essence-hint {
+	font-size: 0.85em;
+	opacity: 0.75;
+	margin-top: 0.25em;
+}
+
+/* Shared header row at the top of the spellcasting tab: Incantation Mode toggle on
+   the left, Refocus button on the right. */
+.sky-spell-tab-header {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 4px 2px 6px;
+}
+
+/* Incantation Mode toggle below the spellcasting tab sub-nav. */
+.sky-incantation-toggle {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 0.9em;
+	cursor: pointer;
+}
+
+.sky-incantation-toggle input {
+	margin: 0;
+	cursor: pointer;
+}
+
+/* Refocus button at the top of the spellcasting tab — blue with white text, styled
+   after the PF2e spell-preparation button. margin-left:auto pushes it to the right
+   edge of the shared header (and keeps it right when the toggle isn't present). */
+.sky-refocus-button {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	flex: 0 0 auto;
+	width: auto;
+	margin: 0 0 0 auto;
+	padding: 3px 12px;
+	font-size: 0.9em;
+	line-height: normal;
+	color: #fff;
+	background: #2c6e9b;
+	border: 1px solid #1d4d6e;
+	border-radius: 3px;
+	box-shadow: none;
+	text-shadow: none;
+	cursor: pointer;
+}
+
+.sky-refocus-button:hover {
+	color: #fff;
+	background: #357fb0;
+	border-color: #1d4d6e;
+	box-shadow: 0 0 4px rgba(53, 127, 176, 0.6);
+}
+
+.sky-refocus-button:disabled {
+	cursor: default;
+	opacity: 0.6;
+}
+
+/* The internal essence-leak toggle (Bounded Second Draw leak tracking) is flipped
+   programmatically only — hide its sheet row so players can't see/flip it. */
+[data-domain][data-option="essence-leak"] {
+	display: none !important;
+}
+
+/* Repurposed per-rank spell counter label ("Spells Known" / "Spells Prepared"). */
+.sky-spell-count-label {
+	margin-left: auto;
+	margin-right: 4px;
+	font-size: 0.8em;
+	font-weight: 600;
+	opacity: 0.75;
+	white-space: nowrap;
+	align-self: center;
+}
+
+/* =====================================================================
+   Tweak: Chat Performance Fix (merged from chat-perf-fix)
+   content-visibility lets the browser skip style+layout for off-screen
+   messages, so the per-delete recalc no longer scales with total history.
+   ===================================================================== */
+ol.chat-log > li.message,
+.chat-log li.message {
+	content-visibility: auto;
+	contain-intrinsic-size: auto 80px;
+}
+
+/* =====================================================================
+   Tweak: Target Conditions (merged from pf2e-target-conditions)
+   Scoped to .chat-message to avoid leaking.
+   ===================================================================== */
+.chat-message .pf2e-tc-panel {
+	margin-top: 0;
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-row {
+	/* Mirror Toolbelt's color variables so outcomes match the rows above */
+	--criticalSuccess: rgb(0, 128, 0);
+	--success: rgb(0, 0, 255);
+	--failure: rgb(255, 106, 0);
+	--criticalFailure: rgb(255, 0, 0);
+
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0 0.5em;
+	padding: 0 0.1em;
+	user-select: none;
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-row::before {
+	content: none;
+}
+
+.chat-message .pf2e-tc-panel hr.pf2e-tc-sep {
+	margin-block: 0.2em;
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-name {
+	font-weight: bold;
+	font-size: 1em;
+	flex: 1 1 auto;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	height: 1.7em;
+	display: flex;
+	align-items: center;
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-outcome {
+	flex: 0 0 auto;
+	font-size: 0.75em;
+	font-weight: bold;
+	white-space: nowrap;
+	opacity: 0.85;
+	height: 1.7em;
+	display: flex;
+	align-items: center;
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-outcome.critical-success { color: var(--criticalSuccess); }
+.chat-message .pf2e-tc-panel .pf2e-tc-outcome.success           { color: var(--success); }
+.chat-message .pf2e-tc-panel .pf2e-tc-outcome.failure           { color: var(--failure); }
+.chat-message .pf2e-tc-panel .pf2e-tc-outcome.critical-failure  { color: var(--criticalFailure); }
+
+.chat-message .pf2e-tc-panel .pf2e-tc-buttons {
+	flex: 0 0 100%;
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 3px;
+	padding-bottom: 0.25em;
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-apply-btn {
+	height: 1.1em;
+	padding: 0 0.5em;
+	font-size: 0.78em;
+	line-height: 1;
+	border: 1px solid #9a9a8a;
+	border-radius: 3px;
+	background: linear-gradient(to bottom, #f0ede0, #dedad0);
+	color: #3a3530;
+	cursor: pointer;
+	white-space: nowrap;
+	transition: filter 0.1s;
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-apply-btn:hover:not(:disabled) {
+	filter: brightness(1.08);
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-apply-btn.applied {
+	background: linear-gradient(to bottom, #d4edda, #b8dfc3);
+	border-color: #6aaa7e;
+	color: #1e5c32;
+	cursor: default;
+}
+
+.chat-message .pf2e-tc-panel .pf2e-tc-apply-btn:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}

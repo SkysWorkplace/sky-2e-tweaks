@@ -1,0 +1,23 @@
+<form>
+	<div class="sky-tweaks-list">
+		{{#each tweaks}}
+		<div class="sky-tweak-row">
+			<div class="sky-tweak-toggle">
+				<input type="checkbox" name="tweaks.{{id}}" id="tweak-{{id}}" {{#if enabled}}checked{{/if}}>
+			</div>
+			<label for="tweak-{{id}}" class="sky-tweak-info">
+				<span class="sky-tweak-name">{{name}}</span>
+				<span class="sky-tweak-hint">{{hint}}</span>
+			</label>
+		</div>
+		{{/each}}
+
+		{{#unless tweaks.length}}
+		<p class="sky-tweaks-empty">No tweaks registered yet.</p>
+		{{/unless}}
+	</div>
+
+	<footer class="sky-tweaks-footer">
+		<button type="submit"><i class="fa-solid fa-floppy-disk"></i> Save Changes</button>
+	</footer>
+</form>
