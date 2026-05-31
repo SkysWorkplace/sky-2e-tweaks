@@ -1837,6 +1837,173 @@ async function _tcApplyToToken(condition, token, btn) {
 }
 
 // =============================================================================
+// Tweak: Life Essence max-rank auto-update
+//
+// Magic+ computes flags.pf2e.maxhealingRank (the Life Essence Reservoir's max =
+// maxhealingRank * healerAdjustment) from the highest-rank non-cantrip healing/harm
+// spell in your essence entries — but ONLY on `updateItem` (when you edit a spell or
+// entry). It never refreshes on a fresh load, a level-up, or just opening the sheet,
+// so the flag goes stale and you end up editing it by hand. This tweak re-runs Magic+'s
+// exact computation as a `renderCharacterSheetPF2e` backstop: idempotent (writes only
+// when the computed rank differs from the stored flag), owner-gated, so it self-corrects
+// without manual edits and without a render loop.
+// =============================================================================
+
+let _maxRankSheetHookId = null;
+
+// Returns the computed max healing rank, or null when the actor isn't an essence caster
+// (so the caller can skip). Mirrors Magic+'s updateLifeEssence updateItem logic.
+async function _computeMaxHealingRank(actor) {
+	if (!actor?.spellcasting) return null;
+	const entries = actor.spellcasting.regular.filter(x => x?.flags?.[MAGICPLUS_ID]?.essence);
+	if (!entries.length) return null;
+
+	let rank = 0;
+	for (const entry of entries) {
+		const sheetData = await entry.getSheetData();
+		const slotSpells = (sheetData.groups ?? [])
+			.flatMap(g => g.active)
+			.filter(x => x && !x.spell?.traits?.has?.("cantrip"));
+		for (const meta of slotSpells) {
+			const isHealing = meta?.spell?.traits?.has?.("healing");
+			const isSpecific = meta?.spell?.slug === "harm";
+			if (isHealing || isSpecific) rank = Math.max(rank, meta?.castRank || meta?.spell?.rank || 0);
+		}
+	}
+	return rank;
+}
+
+async function _onRenderMaxHealingRank(sheet) {
+	const actor = sheet?.actor;
+	// Only an owner can write the flag; non-owner renders no-op.
+	if (!actor?.isOwner) return;
+
+	const rank = await _computeMaxHealingRank(actor);
+	if (rank === null) return; // not an essence caster
+
+	const current = actor.flags?.pf2e?.maxhealingRank ?? 0;
+	if (rank === current) return; // idempotent — the re-render this triggers will no-op
+
+	await actor.update({ "flags.pf2e.maxhealingRank": rank });
+}
+
+registerTweak({
+	id: "lifeEssenceMaxRank",
+	name: "Life Essence Max Rank Auto-Update",
+	hint: "Keeps flags.pf2e.maxhealingRank (the Life Essence Reservoir's max) current by recomputing it from your highest healing/harm spell whenever the sheet renders — Magic+ only refreshes it when you edit your spell list, so it otherwise goes stale.",
+	default: true,
+	onEnable() {
+		if (!_maxRankSheetHookId) {
+			_maxRankSheetHookId = Hooks.on("renderCharacterSheetPF2e", _onRenderMaxHealingRank);
+		}
+	},
+	onDisable() {
+		if (_maxRankSheetHookId) {
+			Hooks.off("renderCharacterSheetPF2e", _maxRankSheetHookId);
+			_maxRankSheetHookId = null;
+		}
+	}
+});
+
+// =============================================================================
+// Tweak: Reservoir remote sync
+//
+// Magic+ deducts/refunds the healer's `life-essence` reservoir in pre-create/-update
+// chat hooks that run on the APPLYING client. When a player applies (or reverts) healing
+// from an essence caster they don't OWN, that actor.update is permission-rejected — the
+// reservoir never moves. Fix: the active GM (who owns every actor) replays the same write
+// on the post hooks, but ONLY when the triggering user doesn't own the healer (when they
+// do, Magic+ already handled it on their client — so we skip to avoid double-counting).
+// Mirrors Magic+'s exact math, so owner/non-owner behave identically. Pool deduction/refund
+// only — the cosmetic "depleted" warning is left to Magic+'s own client-side append.
+// =============================================================================
+
+let _reservoirCreateHookId = null;
+let _reservoirUpdateHookId = null;
+
+function _reservoirHealer(pf2e) {
+	if (!pf2e?.context?.domains?.includes("healing-received")) return null;
+	const { appliedDamage, context, origin } = pf2e;
+	if (!appliedDamage || !context || !origin) return null;
+	const actor = fromUuidSync(origin.actor);
+	if (!actor?.spellcasting) return null;
+	if (!actor.getResource?.("life-essence")) return null;
+	return actor;
+}
+
+// Deduction: GM replays the life-essence spend for a cross-owner heal.
+async function _onReservoirHealApplied(message) {
+	// Cheapest guard first — every non-active-GM client exits here.
+	if (game.users.activeGM !== game.user) return;
+
+	const actor = _reservoirHealer(message.flags?.pf2e);
+	if (!actor) return;
+	if (!message.item?.traits?.has?.("healing")) return;
+
+	// Skip if the message author owns the healer — Magic+ already deducted on their client.
+	const author = message.author;
+	if (author && actor.testUserPermission(author, "OWNER")) return;
+
+	const resource = actor.getResource("life-essence");
+	const appliedHealing = message.flags.pf2e.appliedDamage.updates
+		.find(x => x.path === "system.attributes.hp.value")?.value || 0;
+	if (!appliedHealing) return;
+
+	await actor.updateResource("life-essence", resource.value + appliedHealing, { render: true });
+}
+
+// Refund: GM replays Magic+'s revert refund (diff-based) for a cross-owner revert.
+async function _onReservoirHealReverted(message, changes, options, userId) {
+	if (game.users.activeGM !== game.user) return;
+	if (!changes?.flags?.pf2e?.appliedDamage?.isReverted) return;
+
+	const actor = _reservoirHealer(message.flags?.pf2e);
+	if (!actor) return;
+
+	// Skip if the reverting user owns the healer — Magic+ already refunded on their client.
+	const user = game.users.get(userId);
+	if (user && actor.testUserPermission(user, "OWNER")) return;
+	if (!message.item?.traits?.has?.("healing")) return;
+
+	// Magic+ only stores `diff` when the pool overflowed (depletion) — in that case it
+	// restores the pre-heal value. For a normal heal it stores nothing and refunds
+	// nothing, so we fall back to refunding exactly what we deducted (-appliedHealing).
+	const diff = message.flags?.[MAGICPLUS_ID]?.diff;
+	const appliedHealing = message.flags?.pf2e?.appliedDamage?.updates
+		?.find(x => x.path === "system.attributes.hp.value")?.value || 0;
+	const cashBack = (typeof diff === "number") ? diff : -appliedHealing;
+	if (!cashBack) return;
+
+	const resource = actor.getResource("life-essence");
+	await actor.updateResource("life-essence", resource.value + cashBack, { render: true });
+}
+
+registerTweak({
+	id: "reservoirRemoteSync",
+	name: "Reservoir Remote Sync",
+	hint: "Fixes Magic+'s Life Essence Reservoir not deducting/refunding when a player applies or reverts healing from an essence caster they don't own (a permissions gap). The active GM replays the reservoir change. Requires a GM online.",
+	default: true,
+	onEnable() {
+		if (!_reservoirCreateHookId) {
+			_reservoirCreateHookId = Hooks.on("createChatMessage", _onReservoirHealApplied);
+		}
+		if (!_reservoirUpdateHookId) {
+			_reservoirUpdateHookId = Hooks.on("updateChatMessage", _onReservoirHealReverted);
+		}
+	},
+	onDisable() {
+		if (_reservoirCreateHookId) {
+			Hooks.off("createChatMessage", _reservoirCreateHookId);
+			_reservoirCreateHookId = null;
+		}
+		if (_reservoirUpdateHookId) {
+			Hooks.off("updateChatMessage", _reservoirUpdateHookId);
+			_reservoirUpdateHookId = null;
+		}
+	}
+});
+
+// =============================================================================
 // Core setup
 // =============================================================================
 
