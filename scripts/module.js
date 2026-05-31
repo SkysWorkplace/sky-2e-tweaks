@@ -597,11 +597,12 @@ let _incantationCastHookId = null;
 let _incantationSheetHookId = null;
 let _incantationCombatStartHookId = null;
 let _incantationCombatEndHookId = null;
+let _incantationRestHookId = null;
 
 registerTweak({
 	id: "incantationMode",
 	name: "Incantation Mode",
-	hint: "Adds a per-character Incantation indicator to the spellcasting tab. While you're out of combat, casting an essence spell applies Magic+'s \"Maintaining Incantations\" effect at counter 1 and bumps the counter by 1 on each further cast. The toggle is automatic: off in combat, on out of combat.",
+	hint: "Adds a per-character Incantation indicator to the spellcasting tab. While you're out of combat, casting an essence spell applies Magic+'s \"Maintaining Incantations\" effect at counter 1 and bumps the counter by 1 on each further cast. The toggle is automatic: off in combat, on out of combat. Resting for the night drops concentration and clears the effect.",
 	default: true,
 	onEnable() {
 		if (!_incantationCastHookId) {
@@ -615,6 +616,9 @@ registerTweak({
 		}
 		if (!_incantationCombatEndHookId) {
 			_incantationCombatEndHookId = Hooks.on("deleteCombat", _onCombatEndIncantation);
+		}
+		if (!_incantationRestHookId) {
+			_incantationRestHookId = Hooks.on("pf2e.restForTheNight", _onRestClearIncantations);
 		}
 	},
 	onDisable() {
@@ -634,8 +638,27 @@ registerTweak({
 			Hooks.off("deleteCombat", _incantationCombatEndHookId);
 			_incantationCombatEndHookId = null;
 		}
+		if (_incantationRestHookId) {
+			Hooks.off("pf2e.restForTheNight", _incantationRestHookId);
+			_incantationRestHookId = null;
+		}
 	}
 });
+
+// Rest for the Night drops concentration, so a night's rest should clear any maintained
+// incantations. PF2e's restForTheNight refills daily resources but never removes the
+// Maintaining Incantations effect (it has no duration), so without this it survives the
+// night and keeps suppressing essence draw / pool max until the next Refocus. The hook
+// fires on every client; gate on `primaryUpdater` so exactly one of them does the delete.
+function _onRestClearIncantations(actor) {
+	if (!actor || actor.primaryUpdater !== game.user) return;
+	const incantationEffects = actor.itemTypes?.effect?.filter(
+		e => e.sourceId === MAINTAINING_INCANTATIONS_UUID || e.name === MAINTAINING_INCANTATIONS_NAME
+	) ?? [];
+	if (incantationEffects.length > 0) {
+		actor.deleteEmbeddedDocuments("Item", incantationEffects.map(e => e.id));
+	}
+}
 
 // Incantation Mode is driven by combat state, not manual toggling: ticked OFF when an
 // encounter begins, back ON when it ends. GM client only, to avoid every client racing
