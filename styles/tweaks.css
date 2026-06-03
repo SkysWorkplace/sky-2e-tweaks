@@ -152,17 +152,6 @@
 }
 
 /* =====================================================================
-   Tweak: Chat Performance Fix (merged from chat-perf-fix)
-   content-visibility lets the browser skip style+layout for off-screen
-   messages, so the per-delete recalc no longer scales with total history.
-   ===================================================================== */
-ol.chat-log > li.message,
-.chat-log li.message {
-	content-visibility: auto;
-	contain-intrinsic-size: auto 80px;
-}
-
-/* =====================================================================
    Tweak: Target Conditions (merged from pf2e-target-conditions)
    Scoped to .chat-message to avoid leaking.
    ===================================================================== */

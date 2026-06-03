@@ -886,6 +886,11 @@ const INITIAL_DRAW_NAME = "Initial Draw";
 // lets it through (combatStart fires before `started` settles, so _actorInCombat can
 // still read false at draw time).
 const INITIAL_DRAW_OPTION = "skyInitialDraw";
+// Option flag marking the Essence Conduit +1 write. Like the Initial Draw flag it must
+// bypass both the combat-only increase-block (the feat grants +1 even when the spell
+// wouldn't normally draw, including at draw 0 / essence-blocked) and the Second Draw
+// leak −1 correction (a conduit raise is not a Draw).
+const CONDUIT_OPTION = "skyConduit";
 
 let _combatStartHookId = null;
 let _combatEndHookId = null;
@@ -1018,7 +1023,7 @@ function _wrapUpdateResource(wrapped, resource, value, options) {
 	// After a Bounded caster leaks (a sub-2-action essence cast empties the pool), the
 	// next pool *raise* is their 2nd Draw, which Magic+ over-fills by the Second Draw +1.
 	// Drop that one raise by 1 and consume the leak. Skip our own Initial Draw fill.
-	if (_leakActive && isEssencePool && !options?.[INITIAL_DRAW_OPTION] && _essenceLeaked.has(this.id)) {
+	if (_leakActive && isEssencePool && !options?.[INITIAL_DRAW_OPTION] && !options?.[CONDUIT_OPTION] && _essenceLeaked.has(this.id)) {
 		const current = this.getResource?.(ESSENCE_POOL_SLUG)?.value ?? 0;
 		if (typeof value === "number" && value > current) {
 			_essenceLeaked.delete(this.id);
@@ -1035,6 +1040,9 @@ function _wrapUpdateResource(wrapped, resource, value, options) {
 	// Decreases (e.g. a leak back to 0) always pass through untouched.
 	if (_combatOnlyActive) {
 		if (options?.[INITIAL_DRAW_OPTION]) return wrapped(resource, value, options);
+		// Essence Conduit's deliberate +1 always lands — the feat grants it even when the
+		// spell wouldn't normally draw (focus spells, a leaking 1-action essence spell).
+		if (options?.[CONDUIT_OPTION]) return wrapped(resource, value, options);
 		if (isEssencePool && typeof value === "number") {
 			const current = this.getResource?.(ESSENCE_POOL_SLUG)?.value ?? 0;
 			if (value > current) {
@@ -1450,6 +1458,127 @@ function inspectLeak(actor = canvas.tokens.controlled[0]?.actor) {
 }
 
 // =============================================================================
+// Tweak: Essence Conduit
+//
+// The Essence Conduit feat grants a 1-action "Essence Conduit" ability: "Until the end
+// of your turn, the next time you Cast a Spell that takes 1 or 2 actions to cast, you
+// increase your essence by 1 even if the spell would not normally increase your essence
+// (such as a focus spell). If the spell was a 1-action essence spell, you don't
+// experience an essence leak." The granted action carries no automation (zero rule
+// elements), so we drive it:
+//   1. Using the action posts a chat card → we apply an "Essence Conduit (Armed)" effect
+//      (turn-end expiry) that captures the pre-cast pool value.
+//   2. The next 1- or 2-action Cast a Spell while armed forces the pool to pre+1 and
+//      deletes the effect. pre+1 is the single correct target for every case: a
+//      non-essence/focus spell (Magic+ leaves the pool alone → +1), a 2-action essence
+//      spell (Magic+ already drew +1 → unchanged, no stacking), and a 1-action essence
+//      spell (Magic+ leaks to 0 → forced to pre+1, i.e. no leak and +1).
+// We detect the action by slug ("essence-conduit"), not sourceId — the GrantItem-granted
+// action gets a fresh embedded _id, but its slug (or sluggified name) is stable.
+// =============================================================================
+
+const CONDUIT_ACTION_SLUG = "essence-conduit";
+const CONDUIT_EFFECT_NAME = "Essence Conduit (Armed)";
+const CONDUIT_EFFECT_FLAG = "conduit"; // flags.<MODULE_ID>.conduit marks our effect
+const CONDUIT_PRE_FLAG = "conduitPre"; // flags.<MODULE_ID>.conduitPre stores the pre-cast pool
+
+let _conduitChatHookId = null;
+
+registerTweak({
+	id: "essenceConduit",
+	name: "Essence Conduit",
+	hint: "Automates the Essence Conduit action. Using it (in an encounter) arms an \"Essence Conduit (Armed)\" effect; your next 1- or 2-action Cast a Spell then increases your essence by 1 — even a focus spell or a spell that would normally leak — and the effect clears. Expires at the end of your turn if unused.",
+	default: true,
+	onEnable() {
+		if (!_conduitChatHookId) {
+			_conduitChatHookId = Hooks.on("createChatMessage", _onConduitChat);
+		}
+	},
+	onDisable() {
+		if (_conduitChatHookId) {
+			Hooks.off("createChatMessage", _conduitChatHookId);
+			_conduitChatHookId = null;
+		}
+	}
+});
+
+// Best-effort slug: prefer the item's own slug, else sluggify the name the way PF2e does.
+function _conduitSlug(item) {
+	if (!item) return null;
+	if (item.slug) return item.slug;
+	const sluggify = game.pf2e?.system?.sluggify;
+	if (typeof sluggify === "function") return sluggify(item.name ?? "");
+	return String(item.name ?? "").toLowerCase().replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
+}
+
+function _isConduitEffect(effect) {
+	return effect?.flags?.[MODULE_ID]?.[CONDUIT_EFFECT_FLAG] === true || effect?.name === CONDUIT_EFFECT_NAME;
+}
+
+// Single createChatMessage handler: arm on the Essence Conduit action card, consume on
+// the next qualifying spell card. Casting-client + owner only, so it runs once.
+async function _onConduitChat(message) {
+	if (message.author?.id !== game.userId) return;
+	const actor = message.actor;
+	if (!actor?.isOwner) return;
+
+	// Essence is an encounter mechanic (drawn at initiative); only arm/consume in combat.
+	if (!_actorInCombat(actor)) return;
+
+	const castingId = message.flags?.pf2e?.casting?.id;
+	if (castingId) return _conduitConsume(message, actor);
+
+	// Not a spell card — arm if this is the Essence Conduit action.
+	if (_conduitSlug(message.item) === CONDUIT_ACTION_SLUG) return _conduitArm(actor);
+}
+
+// Apply the armed effect, capturing the current pool value as the +1 baseline. No-op if
+// already armed (don't stack) or if the actor has no essence pool.
+async function _conduitArm(actor) {
+	if (actor.itemTypes?.effect?.some(_isConduitEffect)) return;
+	const pool = actor.getResource?.(ESSENCE_POOL_SLUG);
+	if (!pool) return;
+	const source = {
+		type: "effect",
+		name: CONDUIT_EFFECT_NAME,
+		img: "icons/svg/aura.svg",
+		system: {
+			slug: "essence-conduit-armed",
+			tokenIcon: { show: true },
+			duration: { value: 0, unit: "rounds", sustained: false, expiry: "turn-end" },
+			description: {
+				value: "<p>The next time you Cast a Spell that takes 1 or 2 actions to cast, you increase your essence by 1 even if the spell would not normally increase your essence (such as a focus spell). If the spell was a 1-action essence spell, you don't experience an essence leak.</p>"
+			},
+			rules: []
+		},
+		flags: { [MODULE_ID]: { [CONDUIT_EFFECT_FLAG]: true, [CONDUIT_PRE_FLAG]: pool.value ?? 0 } }
+	};
+	await actor.createEmbeddedDocuments("Item", [source]);
+}
+
+// On a spell card while armed, force the pool to pre+1 for a 1- or 2-action cast (RAW),
+// then clear the effect. A 3-action / reaction / free cast doesn't qualify, so it's left
+// armed until turn-end. Clamped to the pool max.
+async function _conduitConsume(message, actor) {
+	const effect = actor.itemTypes?.effect?.find(_isConduitEffect);
+	if (!effect) return;
+
+	const spell = message.item;
+	if (!spell || spell.type !== "spell") return;
+
+	const time = spell.system?.time?.value;
+	if (time !== "1" && time !== "2") return; // not 1/2 actions — leave armed
+
+	const pool = actor.getResource?.(ESSENCE_POOL_SLUG);
+	if (pool) {
+		const pre = Number(effect.flags?.[MODULE_ID]?.[CONDUIT_PRE_FLAG]) || 0;
+		const target = Math.min(pre + 1, pool.max ?? pre + 1);
+		await actor.updateResource(ESSENCE_POOL_SLUG, target, { render: true, [CONDUIT_OPTION]: true });
+	}
+	await effect.delete();
+}
+
+// =============================================================================
 // Tweak: Essence Spell Counters
 //
 // On a spellcasting entry marked Essence, the per-rank header counter ("2 / 5",
@@ -1711,7 +1840,12 @@ async function _doRefocus(actor) {
 // log (display:none) during a burst of deletions so those per-message reflows are
 // free, then restore once deletions settle. Covers the GM (who calls
 // deleteDocuments) via a wrap, and players (socket-driven) via the delete hook.
-// Companion content-visibility CSS lives in tweaks.css.
+//
+// NOTE: an earlier version of this fix also applied `content-visibility: auto` to
+// every chat message via CSS. That did nothing for the freeze (the cost is the
+// NUMBER of forced reflows, not the cost of one) and it broke chat autoscroll —
+// `contain-intrinsic-size` placeholders make scrollHeight wrong, so scroll-to-bottom
+// lands short of the real bottom. The CSS has been removed; this JS is the whole fix.
 // =============================================================================
 
 const CPF_BURST_THRESHOLD = 3; // hide once this many deletions land in a burst
