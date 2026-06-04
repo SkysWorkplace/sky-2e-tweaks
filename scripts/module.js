@@ -967,6 +967,7 @@ registerTweak({
 			Hooks.off("renderCharacterSheetPF2e", _restoreRenderHookId);
 			_restoreRenderHookId = null;
 		}
+		_clearRestoreDebounce();
 		if (_combatOnlyActive) {
 			_combatOnlyActive = false;
 			_unregisterUpdateResourceWrapper();
@@ -1159,9 +1160,33 @@ function _onEssencePoolUpdate(feat) {
 }
 
 // Backstop: restore slots whenever an essence caster's sheet renders out of combat.
+//
+// CRITICAL: never write embedded items synchronously from a render hook. A level-up
+// re-renders the sheet in a burst WHILE GrantItem is mid-transaction; an embedded-item
+// write in that window re-enters the grant flow and duplicates granted items (the
+// Essence Conduit action spams the sheet). So we DEBOUNCE: each render pushes the
+// restore out, so it only fires once the render burst (and any level-up interaction)
+// has settled — i.e. after grants are committed — and outside the render call stack.
 // Idempotent (no `force`), so it writes at most once per crossed-out state and converges.
+const _restoreDebounceTimers = new Map(); // actorId -> timer
+
 function _onRenderRestoreSlots(sheet) {
-	_restoreEssenceSlots(sheet?.actor);
+	const actor = sheet?.actor;
+	if (!game.user.isGM || !actor?.id) return;
+	if (_actorInCombat(actor)) return;
+	const prev = _restoreDebounceTimers.get(actor.id);
+	if (prev) clearTimeout(prev);
+	_restoreDebounceTimers.set(actor.id, setTimeout(() => {
+		_restoreDebounceTimers.delete(actor.id);
+		// Re-check at fire time: a combat may have started during the debounce window.
+		if (!_actorInCombat(actor)) _restoreEssenceSlots(actor);
+	}, 600));
+}
+
+// Cancel any pending debounced restores (used on tweak disable).
+function _clearRestoreDebounce() {
+	for (const t of _restoreDebounceTimers.values()) clearTimeout(t);
+	_restoreDebounceTimers.clear();
 }
 
 // =============================================================================
@@ -1263,15 +1288,9 @@ function _setBoundedStageForCombat(combat, stage) {
 // operation, so it cannot loop, and it intercepts the exact `updateResource` call
 // Magic+ makes *after* the chat card is built — so there's no timing race with the
 // card text either (the corrected pool value is what gets written).
-//
-// `cleanupLeakRules` is a one-time manual repair (owner-only, `{render:false}`) that
-// strips leftover artifacts from those earlier builds — the inert subtract AEL, the
-// legacy `essence-leak` RollOption, and the `{not: essence-leak}` predicate splice —
-// so upgraded feats return to clean Magic+ behavior.
 // =============================================================================
 
 const ESSENCE_LEAK_OPTION = "essence-leak";
-const LEAK_SUPPRESS_LABEL = "sky-2e-tweaks-leak-suppress";
 
 // Encounter-scoped, per-client leak state: actor ids that have leaked and are owed a
 // −1 correction on their next pool raise (the 2nd Draw). Populated by detection on
@@ -1399,39 +1418,6 @@ function _onLeakCombatBoundary(combat) {
 		const id = combatant.actor?.id;
 		if (id) _essenceLeaked.delete(id);
 	}
-}
-
-// One-time manual repair for feats touched by the earlier rule-element builds. Strips
-// our inert subtract AEL, the legacy `essence-leak` RollOption, and the
-// `{not: essence-leak}` predicate splice so the feat returns to clean Magic+ behavior.
-// Owner-only; writes with `{render:false}` to avoid kicking the sheet. Run once via:
-//   game.modules.get("sky-2e-tweaks").api.cleanupLeakRules(_token.actor)
-async function cleanupLeakRules(actor = canvas.tokens.controlled[0]?.actor) {
-	if (!actor) return console.warn("sky-2e-tweaks: no actor (select a token or pass one).");
-	if (!actor.isOwner) return console.warn("sky-2e-tweaks: not the owner of this actor.");
-	const feat = _findSecondDrawFeat(actor);
-	if (!feat) return console.warn("sky-2e-tweaks: no Second Draw feat found on this actor.");
-
-	const rules = foundry.utils.deepClone(feat.system.rules ?? []);
-	let changed = false;
-
-	// Remove our inert subtract leak-suppress rule and the legacy essence-leak RollOption.
-	for (let i = rules.length - 1; i >= 0; i--) {
-		const r = rules[i];
-		if (r.key === "ActiveEffectLike" && r.label === LEAK_SUPPRESS_LABEL) { rules.splice(i, 1); changed = true; continue; }
-		if (r.key === "RollOption" && r.option === ESSENCE_LEAK_OPTION) { rules.splice(i, 1); changed = true; }
-	}
-	// Strip the legacy `{not: essence-leak}` predicate splice from the +1 AEL.
-	const ael = _findSecondDrawAEL(rules);
-	if (ael && Array.isArray(ael.predicate)) {
-		const cleaned = ael.predicate.filter(p => !(p && typeof p === "object" && p.not === ESSENCE_LEAK_OPTION));
-		if (cleaned.length !== ael.predicate.length) { ael.predicate = cleaned; changed = true; }
-	}
-
-	if (changed) await feat.update({ "system.rules": rules }, { render: false });
-	const msg = changed ? "sky-2e-tweaks: cleaned leftover leak rules." : "sky-2e-tweaks: nothing to clean (feat already clean).";
-	console.log(msg);
-	return msg;
 }
 
 // Diagnostic: dump the live leak state for an actor. Run in console as
@@ -2177,185 +2163,6 @@ async function _tcApplyToToken(condition, token, btn) {
 }
 
 // =============================================================================
-// Tweak: Life Essence max-rank auto-update
-//
-// Magic+ drives the Life Essence Reservoir's max (= flags.pf2e.maxhealingRank *
-// healerAdjustment) but only refreshes maxhealingRank on `updateItem` (editing an existing
-// spell), so gaining a spell on level-up or a fresh page load leaves it stale — and it
-// scans only *healing* spells, which misbehaved. HOUSERULE: rather than fight over that
-// flag (which caused a per-cast "blink"; see _ensureReservoirMax), we leave maxhealingRank
-// to Magic+ and instead bake the highest spell-SLOT rank the entry actually has (see
-// _computeMaxHealingRank) straight into the reservoir feat's SpecialResource max. We
-// recompute on a debounced pass triggered by actor level change, spellcasting-entry
-// create/update, and a one-time load pass, and also resolve the basic essence caster's
-// gated ChoiceSet so their resource renders (see _ensureReservoirMax).
-//
-// IMPORTANT: the recompute writes a document (item.update on the feat's rules), so it must
-// NEVER run inside a render hook or synchronously inside the flurry of changes a level-up
-// fires — a re-entrant write during PF2e's grant transaction DUPLICATES granted feats and
-// spins the sheet (this is exactly the bug an earlier render-hook version caused). We
-// debounce per actor so the single write lands only after the storm settles.
-// =============================================================================
-
-let _maxRankUpdateActorHookId = null;
-let _maxRankEntryCreateHookId = null;
-let _maxRankEntryUpdateHookId = null;
-let _maxRankReadyHookId = null;
-// actorId -> pending setTimeout handle.
-const _maxRankTimers = new Map();
-
-// True when the actor is a *basic* essence caster (Wizard-Dedication-style limited variant).
-// Their spellcasting entry isn't flagged pf2e-team-plus-magic.essence like full/bounded
-// entries, so detect via the roll option (no-domain -> "all") with a feat-slug fallback.
-function _isBasicEssence(actor) {
-	if (actor?.flags?.pf2e?.rollOptions?.all?.["essence-caster:basic"]) return true;
-	if (actor?.rollOptions?.all?.["essence-caster:basic"]) return true;
-	return actor?.itemTypes?.feat?.some(f => f.slug === "basic-essence-spellcasting") ?? false;
-}
-
-// Returns the computed max rank, or null when the actor isn't an essence caster (so the
-// caller can skip). HOUSERULE: the Reservoir max tracks the highest SPELL-SLOT RANK the
-// entry actually has slots for — i.e. the top rank N where slotN.max > 0 (cantrips/slot0
-// excluded). We scan the real slots rather than entry.highestRank (which reports the
-// theoretical max for the caster's level and so over-counts archetype casters, who gain
-// ranks far slower than ceil(level/2)). Independent of which spells are prepared/known.
-async function _computeMaxHealingRank(actor) {
-	if (!actor?.spellcasting) return null;
-	const regular = actor.spellcasting.regular ?? [];
-	let entries = regular.filter(x => x?.flags?.[MAGICPLUS_ID]?.essence);
-	// Basic casters' dedication entry isn't flagged essence — fall back to all regular entries.
-	if (!entries.length && _isBasicEssence(actor)) entries = [...regular];
-	if (!entries.length) return null;
-
-	let rank = 0;
-	for (const entry of entries) {
-		const slots = entry.system?.slots ?? {};
-		for (const [key, slot] of Object.entries(slots)) {
-			if ((slot?.max ?? 0) <= 0) continue;
-			const n = Number(key.replace("slot", "")) || 0; // slot0 = cantrips -> 0, excluded
-			if (n > rank) rank = n;
-		}
-	}
-	return rank;
-}
-
-// HOUSERULE / DECOUPLE: Magic+'s Life Essence Reservoir SpecialResource max is
-// `@actor.flags.pf2e.maxhealingRank * @item...healerAdjustment`, and Magic+'s own updateItem
-// handler rewrites flags.pf2e.maxhealingRank (from your highest *healing* spell, no
-// idempotency guard) on every spell-entry change — including casting, which consumes a slot.
-// While we also wrote maxhealingRank (our slot-based value), the two disagreed and the
-// reservoir "blinked" between sizes on every cast (Magic+ writes its value -> render, we
-// write ours back -> render). Fix: we no longer write maxhealingRank at all (so Magic+ owns
-// it and its repeated same-value writes are no-op diffs), and instead bake our slot-based
-// rank straight into the reservoir feat's SpecialResource max as a literal, keeping the
-// healerAdjustment multiplier dynamic via the flag. The reservoir then ignores maxhealingRank
-// entirely and only changes when our slot rank does.
-//
-// Additionally for *basic* essence casters: Magic+ gates the healerAdjustment ChoiceSet off
-// (predicate {not: "essence-caster:basic"}), so it's ignored and never resolves — which
-// leaves the SpecialResource unresolved and the resource never renders. We resolve it by
-// removing the predicate and baking in selection 12 (the "None" baseline) so it resolves
-// silently. Idempotent (skips when already correct) and one-time (a feat rules update fires
-// no hook that re-schedules us), so it never loops.
-async function _ensureReservoirMax(actor) {
-	if (!actor?.isOwner) return;
-	const rank = await _computeMaxHealingRank(actor);
-	if (rank === null) return; // not an essence caster
-
-	const feat = actor.itemTypes?.feat?.find(f =>
-		(f._source?.system?.rules ?? []).some(r => r.key === "SpecialResource" && r.slug === "life-essence"));
-	if (!feat) return;
-
-	const rules = foundry.utils.deepClone(feat._source.system.rules);
-	const sr = rules.find(r => r.key === "SpecialResource" && r.slug === "life-essence");
-	const cs = rules.find(r => r.key === "ChoiceSet" && r.flag === "healerAdjustment");
-	if (!sr) return;
-
-	let changed = false;
-
-	// Slot-based rank as a literal; healerAdjustment stays dynamic (respects the player's
-	// None/Healer/Grand Healer pick, and the basic-caster selection we force below).
-	const desiredMax = `${rank} * @item.flags.pf2e.rulesSelections.healerAdjustment`;
-	if (sr.max !== desiredMax) { sr.max = desiredMax; changed = true; }
-
-	// Basic casters: resolve the otherwise-skipped ChoiceSet so the resource renders.
-	if (_isBasicEssence(actor) && cs) {
-		if (cs.predicate !== undefined) { delete cs.predicate; changed = true; }
-		if (cs.selection !== 12) { cs.selection = 12; changed = true; }
-	}
-
-	if (!changed) return; // already houseruled — no write, no loop
-	await feat.update({ "system.rules": rules });
-}
-
-// Runs the full reservoir refresh for an actor.
-async function _refreshReservoir(actor) {
-	await _ensureReservoirMax(actor);
-}
-
-// Debounces the write per actor (300ms) so a level-up's flurry of item changes
-// collapses into a single update that lands AFTER the grant transaction settles —
-// never re-entrant, so it can't duplicate granted feats or spin the sheet.
-function _scheduleMaxHealingRank(actor) {
-	if (!actor?.id || !actor.isOwner) return;
-	const prev = _maxRankTimers.get(actor.id);
-	if (prev) clearTimeout(prev);
-	_maxRankTimers.set(actor.id, setTimeout(() => {
-		_maxRankTimers.delete(actor.id);
-		_refreshReservoir(actor);
-	}, 300));
-}
-
-function _onUpdateActorMaxRank(actor, changes) {
-	if (actor?.type !== "character") return;
-	// Only react when level actually changed; ignore unrelated actor updates
-	// (including our own maxhealingRank write, which the idempotent guard also catches).
-	if (changes?.system?.details?.level?.value === undefined) return;
-	_scheduleMaxHealingRank(actor);
-}
-
-// Fires when a spellcasting entry is created or its slots/proficiency change — covers a
-// brand-new caster (or one gaining an archetype dedication) where level never changes, so
-// the updateActor trigger and a prior ready pass would both miss it.
-function _onEntryChangeMaxRank(item) {
-	if (item?.type !== "spellcastingEntry") return;
-	const actor = item.actor;
-	if (actor?.type !== "character") return;
-	_scheduleMaxHealingRank(actor);
-}
-
-// One-time pass on load so fresh page loads (where nothing changed) aren't stale.
-function _onReadyMaxRank() {
-	for (const actor of game.actors ?? []) {
-		if (actor?.type !== "character" || !actor.isOwner) continue;
-		const hasEssence = actor.spellcasting?.regular?.some(x => x?.flags?.[MAGICPLUS_ID]?.essence);
-		if (hasEssence || _isBasicEssence(actor)) _scheduleMaxHealingRank(actor);
-	}
-}
-
-registerTweak({
-	id: "lifeEssenceMaxRank",
-	name: "Life Essence Max Rank Auto-Update",
-	hint: "Keeps the Life Essence Reservoir's max current. Houserule: the reservoir is sized from the highest spell-slot rank your essence entry actually has (times your healer adjustment), recomputed on level change, spell-entry changes, and a one-time load pass — so it climbs (or drops) with your slots and is otherwise left alone. Decoupled from Magic+'s maxhealingRank flag to stop the per-cast reservoir blink, and also enables the reservoir for basic essence casters.",
-	default: true,
-	onEnable() {
-		if (!_maxRankUpdateActorHookId) _maxRankUpdateActorHookId = Hooks.on("updateActor", _onUpdateActorMaxRank);
-		if (!_maxRankEntryCreateHookId) _maxRankEntryCreateHookId = Hooks.on("createItem", _onEntryChangeMaxRank);
-		if (!_maxRankEntryUpdateHookId) _maxRankEntryUpdateHookId = Hooks.on("updateItem", _onEntryChangeMaxRank);
-		if (game.ready) _onReadyMaxRank();
-		else if (!_maxRankReadyHookId) _maxRankReadyHookId = Hooks.once("ready", _onReadyMaxRank);
-	},
-	onDisable() {
-		if (_maxRankUpdateActorHookId) { Hooks.off("updateActor", _maxRankUpdateActorHookId); _maxRankUpdateActorHookId = null; }
-		if (_maxRankEntryCreateHookId) { Hooks.off("createItem", _maxRankEntryCreateHookId); _maxRankEntryCreateHookId = null; }
-		if (_maxRankEntryUpdateHookId) { Hooks.off("updateItem", _maxRankEntryUpdateHookId); _maxRankEntryUpdateHookId = null; }
-		if (_maxRankReadyHookId) { Hooks.off("ready", _maxRankReadyHookId); _maxRankReadyHookId = null; }
-		for (const handle of _maxRankTimers.values()) clearTimeout(handle);
-		_maxRankTimers.clear();
-	}
-});
-
-// =============================================================================
 // Tweak: Reservoir remote sync
 //
 // Magic+ deducts/refunds the healer's `life-essence` reservoir in pre-create/-update
@@ -2402,23 +2209,27 @@ async function _onReservoirHealApplied(message) {
 	await actor.updateResource("life-essence", resource.value + appliedHealing, { render: true });
 }
 
-// Refund: GM replays Magic+'s revert refund (diff-based) for a cross-owner revert.
+// Refund: GM replays the life-essence refund on revert.
 async function _onReservoirHealReverted(message, changes, options, userId) {
 	if (game.users.activeGM !== game.user) return;
 	if (!changes?.flags?.pf2e?.appliedDamage?.isReverted) return;
 
 	const actor = _reservoirHealer(message.flags?.pf2e);
 	if (!actor) return;
-
-	// Skip if the reverting user owns the healer — Magic+ already refunded on their client.
-	const user = game.users.get(userId);
-	if (user && actor.testUserPermission(user, "OWNER")) return;
 	if (!message.item?.traits?.has?.("healing")) return;
 
-	// Magic+ only stores `diff` when the pool overflowed (depletion) — in that case it
-	// restores the pre-heal value. For a normal heal it stores nothing and refunds
-	// nothing, so we fall back to refunding exactly what we deducted (-appliedHealing).
+	// Magic+'s native revert ONLY refunds the `diff` it stores on the overflow/depletion case
+	// (a normal-heal revert is a no-op on its side), and only when the reverting client owns
+	// the healer (otherwise its write is permission-rejected). So skip exactly that one case —
+	// owner revert WITH a diff, which Magic+ already handled — and own everything else here:
+	// cross-owner reverts (permission gap) AND the normal-heal refund (no diff) that Magic+
+	// never does, for owner and non-owner alike. (appliedHealing is negative — healing is
+	// negative damage — so -appliedHealing adds the spent essence back.)
 	const diff = message.flags?.[MAGICPLUS_ID]?.diff;
+	const user = game.users.get(userId);
+	const ownerRevert = user && actor.testUserPermission(user, "OWNER");
+	if (ownerRevert && typeof diff === "number") return;
+
 	const appliedHealing = message.flags?.pf2e?.appliedDamage?.updates
 		?.find(x => x.path === "system.attributes.hp.value")?.value || 0;
 	const cashBack = (typeof diff === "number") ? diff : -appliedHealing;
@@ -2431,7 +2242,7 @@ async function _onReservoirHealReverted(message, changes, options, userId) {
 registerTweak({
 	id: "reservoirRemoteSync",
 	name: "Reservoir Remote Sync",
-	hint: "Fixes Magic+'s Life Essence Reservoir not deducting/refunding when a player applies or reverts healing from an essence caster they don't own (a permissions gap). The active GM replays the reservoir change. Requires a GM online.",
+	hint: "Fixes two Life Essence Reservoir gaps: (1) Magic+ doesn't deduct/refund when a player applies or reverts healing from an essence caster they don't own (a permissions gap); (2) Magic+'s revert only gives essence back when the reservoir overflowed, so undoing a normal heal never refunds it. The active GM replays the reservoir change so any heal apply/undo is reflected, owned or not. Requires a GM online.",
 	default: true,
 	onEnable() {
 		if (!_reservoirCreateHookId) {
@@ -2486,7 +2297,7 @@ Hooks.once("ready", () => {
 		}
 	}
 	const mod = game.modules.get(MODULE_ID);
-	if (mod) mod.api = Object.assign(mod.api ?? {}, { inspectLeak, leakDebug, cleanupLeakRules });
+	if (mod) mod.api = Object.assign(mod.api ?? {}, { inspectLeak, leakDebug });
 });
 
 // ----- Settings UI -----
