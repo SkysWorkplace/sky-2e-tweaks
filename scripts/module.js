@@ -303,8 +303,6 @@ async function _handleBoundedVariableSpell(message, spell, actor, pool, rollOpti
 	await _storeBoundedSpellAddendum(message, actor, true, rollOptions);
 }
 
-// The Magic+ "Advance Essence" macro link the native addendum sections carry.
-const ADVANCE_ESSENCE_UUID = "Compendium.pf2e-team-plus-magic.macros.Macro.xeIg0bIuK8AgH5AR";
 const ESSENCE_ADDENDA_FLAG = "essenceAddenda";
 
 // Build the Magic+ essence card sections, enrich their @UUID links, and stash them
@@ -318,14 +316,12 @@ async function _storeEssenceAddenda(message, actor, { leak, wasAtMax, cycleTermi
 	const entries = [];
 
 	const essenceLabel = _findEssenceFeatName(actor);
-	const advanceLink = `@UUID[${ADVANCE_ESSENCE_UUID}]{Advance Essence}`;
 	entries.push({
 		match: leak ? "causes an essence leak" : "increases your essence pool by 1",
 		html: await enrich(_addendum(essenceLabel, [
 			leak
 				? "Casting this spell causes an essence leak, reducing you to 0 essence!"
-				: "Casting this spell increases your essence pool by 1!",
-			advanceLink
+				: "Casting this spell increases your essence pool by 1!"
 		]))
 	});
 
@@ -477,11 +473,10 @@ function _boundedCleanLine(rollOptions) {
 async function _storeBoundedSpellAddendum(message, actor, leak, rollOptions) {
 	const TextEditor = foundry.applications.ux.TextEditor.implementation;
 	const label = _findEssenceFeatName(actor);
-	const advanceLink = `@UUID[${ADVANCE_ESSENCE_UUID}]{Advance Essence}`;
 	const { text, match } = leak
 		? { text: "Casting this spell causes an essence leak, reducing you to 0 essence!", match: "causes an essence leak" }
 		: _boundedCleanLine(rollOptions);
-	const html = await TextEditor.enrichHTML(_addendum(label, [text, advanceLink]), { relativeTo: actor });
+	const html = await TextEditor.enrichHTML(_addendum(label, [text]), { relativeTo: actor });
 	await message.setFlag(MODULE_ID, ESSENCE_ADDENDA_FLAG, [{ match, html }]);
 }
 
@@ -2163,18 +2158,27 @@ async function _tcApplyToToken(condition, token, btn) {
 }
 
 // =============================================================================
-// Tweak: Reservoir remote sync
+// Tweak: Life Essence Reservoir (Magic+ hook takeover)
 //
-// Magic+ deducts/refunds the healer's `life-essence` reservoir in pre-create/-update
-// chat hooks that run on the APPLYING client. When a player applies (or reverts) healing
-// from an essence caster they don't OWN, that actor.update is permission-rejected — the
-// reservoir never moves. Fix: the active GM (who owns every actor) replays the same write
-// on the post hooks, but ONLY when the triggering user doesn't own the healer (when they
-// do, Magic+ already handled it on their client — so we skip to avoid double-counting).
-// Mirrors Magic+'s exact math, so owner/non-owner behave identically. Pool deduction/refund
-// only — the cosmetic "depleted" warning is left to Magic+'s own client-side append.
+// Magic+ 1.2.1 broke its own Life Essence deduction: it now skips any healing item with
+// the `essence` trait — but Magic+ STAMPS that trait on every non-cantrip spell cast from
+// an essence entry (toggleEssence's ItemAlteration), so an essence caster's own heals no
+// longer drain the reservoir at all. Its deduction also only runs on the applying client
+// (permission-blocked cross-owner), and its revert only refunds the overflow `diff` (a
+// normal-heal undo never refunds). Rather than route around all that, we TAKE OVER: on
+// enable we remove Magic+'s two life-essence hooks (its preCreate deduction + preUpdate
+// revert) and become the sole handler. The active GM owns every actor, so a single GM-side
+// pass handles owner and cross-owner identically, with no double-counting to reason about.
+//
+// We deduct on any healing, non-cantrip item (essence included), stash the exact delta we
+// applied on the message, and undo precisely that delta on revert. NOTE: disabling this
+// tweak does not re-register Magic+'s removed hooks — reload the world to restore them. The
+// cosmetic "reservoir depleted" warning card Magic+ appended is not reproduced (pool math
+// only). Magic+'s `updateItem` maxhealingRank handler (which sizes the reservoir's MAX) is
+// left untouched.
 // =============================================================================
 
+const RESERVOIR_DELTA_FLAG = "reservoirDelta"; // the exact life-essence change we applied
 let _reservoirCreateHookId = null;
 let _reservoirUpdateHookId = null;
 
@@ -2188,63 +2192,103 @@ function _reservoirHealer(pf2e) {
 	return actor;
 }
 
-// Deduction: GM replays the life-essence spend for a cross-owner heal.
-async function _onReservoirHealApplied(message) {
-	// Cheapest guard first — every non-active-GM client exits here.
-	if (game.users.activeGM !== game.user) return;
+// A heal that should drain the reservoir: healing trait, not a cantrip. Unlike Magic+ 1.2.1
+// we deliberately INCLUDE essence-trait heals (an essence caster's own healing is exactly
+// what should spend the reservoir — the thing 1.2.1 regressed).
+function _reservoirHealQualifies(item) {
+	const t = item?.traits;
+	return !!t?.has?.("healing") && !t.has("cantrip");
+}
 
+// Remove Magic+'s two life-essence chat hooks so ours is the sole handler. We can't grab
+// their (anonymous) callbacks directly, so we scan the registry for callbacks on those
+// hooks whose source mentions both "life-essence" and "healing-received" (specific to the
+// two life-essence handlers; their maxhealingRank `updateItem` hook is left alone). Written
+// defensively against Foundry's internal Hooks shape, and a no-op if it can't find them.
+function _disableMagicLifeEssenceHooks() {
+	const targets = ["preCreateChatMessage", "preUpdateChatMessage"];
+	const events = Hooks.events;
+	if (!events || typeof events !== "object") return 0;
+	const matches = (fn) => typeof fn === "function"
+		&& fn.toString().includes("life-essence") && fn.toString().includes("healing-received");
+	let removed = 0;
+	const off = (hook, entry) => {
+		const fn = (typeof entry === "function") ? entry : entry?.fn;
+		if (!matches(fn)) return;
+		try { Hooks.off(hook, entry?.id ?? fn); removed++; } catch { /* ignore */ }
+	};
+	// Shape A: events[hookName] = HookedFunction[] (or raw fn[])
+	for (const hook of targets) {
+		const list = events[hook];
+		if (Array.isArray(list)) for (const entry of [...list]) off(hook, entry);
+	}
+	// Shape B: events = { [id]: { hook, id, fn } }
+	for (const entry of Object.values(events)) {
+		if (entry && typeof entry === "object" && targets.includes(entry.hook)) off(entry.hook, entry);
+	}
+	if (removed) {
+		console.log(`${MODULE_ID} | took over Magic+ Life Essence: removed ${removed} native hook(s).`);
+	} else if (game.modules.get(MAGICPLUS_ID)?.active) {
+		// Magic+ is present but we removed nothing — its hooks would still run alongside ours,
+		// double-deducting non-essence heals. Surface it loudly so it isn't silently wrong.
+		console.warn(`${MODULE_ID} | Life Essence Reservoir Fix: could NOT find Magic+'s native life-essence hooks to remove (Foundry Hooks internals may have changed). Non-essence heals may double-deduct — please report this.`);
+		ui.notifications?.warn("Sky's 2e Tweaks: couldn't take over Magic+'s Life Essence hooks — non-essence heals may double-deduct. See console.");
+	}
+	return removed;
+}
+
+// Deduction: spend the reservoir for ANY qualifying heal, owner or cross-owner alike (we're
+// the only handler now). Stash the exact delta applied so revert can undo precisely.
+async function _onReservoirHealApplied(message) {
+	if (game.users.activeGM !== game.user) return;
 	const actor = _reservoirHealer(message.flags?.pf2e);
 	if (!actor) return;
-	if (!message.item?.traits?.has?.("healing")) return;
-
-	// Skip if the message author owns the healer — Magic+ already deducted on their client.
-	const author = message.author;
-	if (author && actor.testUserPermission(author, "OWNER")) return;
+	if (!_reservoirHealQualifies(message.item)) return;
+	if (typeof message.getFlag(MODULE_ID, RESERVOIR_DELTA_FLAG) === "number") return; // already applied
 
 	const resource = actor.getResource("life-essence");
+	// Healing is recorded as negative damage, so this value is negative — adding it spends.
 	const appliedHealing = message.flags.pf2e.appliedDamage.updates
 		.find(x => x.path === "system.attributes.hp.value")?.value || 0;
 	if (!appliedHealing) return;
 
-	await actor.updateResource("life-essence", resource.value + appliedHealing, { render: true });
+	const max = Number.isFinite(resource.max) ? resource.max : Infinity;
+	const target = Math.max(0, Math.min(max, resource.value + appliedHealing));
+	const delta = target - resource.value;
+	if (!delta) return;
+
+	await actor.updateResource("life-essence", target, { render: true });
+	await message.setFlag(MODULE_ID, RESERVOIR_DELTA_FLAG, delta);
 }
 
-// Refund: GM replays the life-essence refund on revert.
-async function _onReservoirHealReverted(message, changes, options, userId) {
+// Refund: undo exactly the delta we applied on deduction (no diff guesswork, no Magic+ to
+// coordinate with — we own it end to end).
+async function _onReservoirHealReverted(message, changes) {
 	if (game.users.activeGM !== game.user) return;
 	if (!changes?.flags?.pf2e?.appliedDamage?.isReverted) return;
-
 	const actor = _reservoirHealer(message.flags?.pf2e);
 	if (!actor) return;
-	if (!message.item?.traits?.has?.("healing")) return;
 
-	// Magic+'s native revert ONLY refunds the `diff` it stores on the overflow/depletion case
-	// (a normal-heal revert is a no-op on its side), and only when the reverting client owns
-	// the healer (otherwise its write is permission-rejected). So skip exactly that one case —
-	// owner revert WITH a diff, which Magic+ already handled — and own everything else here:
-	// cross-owner reverts (permission gap) AND the normal-heal refund (no diff) that Magic+
-	// never does, for owner and non-owner alike. (appliedHealing is negative — healing is
-	// negative damage — so -appliedHealing adds the spent essence back.)
-	const diff = message.flags?.[MAGICPLUS_ID]?.diff;
-	const user = game.users.get(userId);
-	const ownerRevert = user && actor.testUserPermission(user, "OWNER");
-	if (ownerRevert && typeof diff === "number") return;
-
-	const appliedHealing = message.flags?.pf2e?.appliedDamage?.updates
-		?.find(x => x.path === "system.attributes.hp.value")?.value || 0;
-	const cashBack = (typeof diff === "number") ? diff : -appliedHealing;
-	if (!cashBack) return;
+	const delta = message.getFlag(MODULE_ID, RESERVOIR_DELTA_FLAG);
+	if (typeof delta !== "number" || delta === 0) return;
 
 	const resource = actor.getResource("life-essence");
-	await actor.updateResource("life-essence", resource.value + cashBack, { render: true });
+	const max = Number.isFinite(resource.max) ? resource.max : Infinity;
+	const target = Math.max(0, Math.min(max, resource.value - delta));
+	await actor.updateResource("life-essence", target, { render: true });
+	await message.unsetFlag(MODULE_ID, RESERVOIR_DELTA_FLAG);
 }
 
 registerTweak({
 	id: "reservoirRemoteSync",
-	name: "Reservoir Remote Sync",
-	hint: "Fixes two Life Essence Reservoir gaps: (1) Magic+ doesn't deduct/refund when a player applies or reverts healing from an essence caster they don't own (a permissions gap); (2) Magic+'s revert only gives essence back when the reservoir overflowed, so undoing a normal heal never refunds it. The active GM replays the reservoir change so any heal apply/undo is reflected, owned or not. Requires a GM online.",
+	name: "Life Essence Reservoir Fix",
+	hint: "Takes over Magic+'s Life Essence automation, which 1.2.1 broke: it now skips any healing spell with the essence trait — i.e. an essence caster's own heals — so the reservoir never drains. This removes Magic+'s two life-essence hooks and handles it from the GM instead: any non-cantrip healing spell (essence included) deducts the reservoir, and reverting a heal refunds the exact amount, for owned and unowned casters alike. Requires a GM online. (Disabling needs a world reload to restore Magic+'s native handling.)",
 	default: true,
 	onEnable() {
+		// Take over: drop Magic+'s native life-essence hooks so we're the only handler. Run
+		// once now (Magic+ registers at load, before our ready) — defer to ready if needed.
+		if (game.ready) _disableMagicLifeEssenceHooks();
+		else Hooks.once("ready", _disableMagicLifeEssenceHooks);
 		if (!_reservoirCreateHookId) {
 			_reservoirCreateHookId = Hooks.on("createChatMessage", _onReservoirHealApplied);
 		}
