@@ -2309,6 +2309,74 @@ registerTweak({
 });
 
 // =============================================================================
+// Tweak: Magic+ Aspect Fixes
+//
+// Patches two content bugs in Magic+'s Aspect spells, applied as each aspect item lands on
+// an actor (createItem). GM-only, idempotent (the corrected forms no longer match), and
+// confined to the aspect items themselves — no GrantItem chains involved, so it can't loop
+// or corrupt grants.
+//
+// 1. DC 0 (Summon X Aspect abilities). Inline save DCs are authored
+//    `dc:@actor.flags.pf2e.aspectDC`, but PF2e only evaluates an inline-check DC as a formula
+//    when the value starts with `resolve(...)` (system parser: `resolvable =
+//    dc.startsWith("resolve")`). Without the wrapper PF2e does `Number("@actor.flags…")` ->
+//    NaN -> DC 0. We wrap it: `dc:resolve(@actor.flags.pf2e.aspectDC)`.
+//
+// 2. Battle-form save override (Aspect Shift on yourself). Pest/Fey Shift give raw numeric
+//    "Save Adjustment" FlatModifiers (e.g. fort -2, ref +1) but flag them `battleForm: true`,
+//    which makes PF2e REPLACE the save with that literal (and zero unlisted saves) instead of
+//    adding. Ooze/Animal do the same kind of raw adjustment correctly with `battleForm:false`.
+//    We flip numeric save adjustments from battleForm:true -> false so they add. Player-picked
+//    `{…rulesSelections}` battle forms (intentional) are left alone (their value isn't numeric).
+// =============================================================================
+
+const ASPECT_DC_BAD = "dc:@actor.flags.pf2e.aspectDC";
+const ASPECT_DC_GOOD = "dc:resolve(@actor.flags.pf2e.aspectDC)";
+let _aspectFixHookId = null;
+
+registerTweak({
+	id: "aspectFixes",
+	name: "Magic+ Aspect Fixes",
+	hint: "Fixes two Magic+ Aspect content bugs as aspects are applied: (1) Summon X Aspect save abilities (Breath Weapon, etc.) showing \"DC 0\" — their inline DCs lack the resolve() wrapper PF2e needs; (2) Pest/Fey Aspect Shift snapping your saves to raw values (e.g. -2/1/0) instead of adjusting them, because the adjustments are wrongly flagged as battle-form overrides. Applies to newly created/summoned aspects — re-apply any that pre-date enabling this.",
+	default: true,
+	onEnable() {
+		if (!_aspectFixHookId) _aspectFixHookId = Hooks.on("createItem", _onAspectItemCreated);
+	},
+	onDisable() {
+		if (_aspectFixHookId) { Hooks.off("createItem", _aspectFixHookId); _aspectFixHookId = null; }
+	}
+});
+
+// A raw-numeric save FlatModifier wrongly flagged as a battle-form override (should add).
+function _isBadAspectSaveRule(r) {
+	return r?.key === "FlatModifier"
+		&& (r.selector === "fortitude" || r.selector === "reflex" || r.selector === "will")
+		&& typeof r.value === "number"
+		&& r.battleForm === true;
+}
+
+// Apply both aspect fixes to a freshly-created aspect item. GM-only so exactly one client
+// writes; idempotent, so the follow-up updateItem finds nothing to do.
+function _onAspectItemCreated(item) {
+	if (!game.user.isGM || !item.actor) return;
+	const update = {};
+
+	// Fix 1: wrap the unwrapped inline aspect DC.
+	const desc = item.system?.description?.value;
+	if (desc && desc.includes(ASPECT_DC_BAD)) {
+		update["system.description.value"] = desc.replaceAll(ASPECT_DC_BAD, ASPECT_DC_GOOD);
+	}
+
+	// Fix 2: un-flag numeric save adjustments wrongly marked battleForm.
+	const rules = item.system?.rules;
+	if (Array.isArray(rules) && rules.some(_isBadAspectSaveRule)) {
+		update["system.rules"] = rules.map(r => _isBadAspectSaveRule(r) ? { ...r, battleForm: false } : r);
+	}
+
+	if (Object.keys(update).length) item.update(update);
+}
+
+// =============================================================================
 // Core setup
 // =============================================================================
 
