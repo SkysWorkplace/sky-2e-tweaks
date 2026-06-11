@@ -995,17 +995,24 @@ function _onCombatStartDraw(combat) {
 			if (opts.some(o => o.startsWith(`${BOUNDED_TIME_OPTION}:`)) && !opts.includes(`${BOUNDED_TIME_OPTION}:0`)) {
 				actor.toggleRollOption("all", BOUNDED_TIME_OPTION, null, true, "0");
 			}
-			_crossOutEssenceSlots(actor);
+			_syncEssenceSlots(actor);
 			continue;
 		}
 
+		// Draw > 0. Initial Draw (level 5+) casters get their pool filled, and that write's
+		// updateItem hook performs the slot sync. Everyone else gets no pool write at combat
+		// start — their pool sits at 0 (cleared at the last combat's end) while their slots
+		// still show the out-of-combat "all available" state — so sync directly here, or the
+		// slots stay wrong until the first cast moves the pool.
 		const hasInitialDraw = actor.items?.some?.(
 			i => i.sourceId === INITIAL_DRAW_UUID || i.name === INITIAL_DRAW_NAME
 		);
-		if (!hasInitialDraw) continue;
 		const pool = actor.getResource?.(ESSENCE_POOL_SLUG);
-		if (!pool || pool.value >= draw) continue;
-		actor.updateResource(ESSENCE_POOL_SLUG, draw, { render: true, [INITIAL_DRAW_OPTION]: true });
+		if (hasInitialDraw && pool && pool.value < draw) {
+			actor.updateResource(ESSENCE_POOL_SLUG, draw, { render: true, [INITIAL_DRAW_OPTION]: true });
+		} else {
+			_syncEssenceSlots(actor);
+		}
 	}
 }
 
@@ -1108,14 +1115,16 @@ function _restoreEssenceSlots(actor, { force = false } = {}) {
 	if (updates.length) actor.updateEmbeddedDocuments("Item", updates);
 }
 
-// Inverse of `_restoreEssenceSlots`: cross out (expend) every ranked essence slot the
-// pool can't currently afford, mirroring Magic+'s `updateEssencePool` expend pass
-// (`expended = pool.value < rank`). We need our own copy because Magic+ only re-runs that
-// pass on a pool *change* — at draw 0 the pool never moves off 0 at combat start, so the
-// out-of-combat "everything available" state would otherwise persist into turn 1. GM-only;
-// writes to entry items (not the pool), and is idempotent (already-expended slots produce
-// no diff), so it converges and can't loop.
-function _crossOutEssenceSlots(actor) {
+// Two-way slot sync: set every ranked essence slot to exactly what the pool affords,
+// mirroring Magic+'s `updateEssencePool` pass (`expended = pool.value < rank`) in BOTH
+// directions — cross out what's unaffordable, restore what is. We need our own copy
+// because Magic+ only re-runs that pass on a pool *change* it observes (at draw 0 the
+// pool never moves off 0 at combat start), and its in-combat handler has proven
+// unreliable, so we drive the state ourselves on every pool update. GM-only; writes to
+// entry items (not the pool), and is idempotent (a slot already in the target state
+// produces no diff), so it converges, can't loop, and coexists with Magic+'s own
+// handler doing the same math.
+function _syncEssenceSlots(actor) {
 	if (!game.user.isGM || !actor) return;
 	const poolValue = actor.getResource?.(ESSENCE_POOL_SLUG)?.value ?? 0;
 	const updates = [];
@@ -1125,17 +1134,18 @@ function _crossOutEssenceSlots(actor) {
 		for (const slot in entry.system.slots) {
 			const rank = Number(slot.replace("slot", ""));
 			if (rank === 0) continue;
-			if (poolValue >= rank) continue; // affordable — leave it as-is
+			const expended = poolValue < rank;
 			const slotData = entry.system.slots[slot];
 			if (entry.isPrepared) {
 				const prepared = slotData.prepared ?? [];
-				if (prepared.some(x => !x.expended)) {
-					obj[`system.slots.${slot}.prepared`] = prepared.map(x => ({ ...x, expended: true }));
+				if (prepared.some(x => !!x.expended !== expended)) {
+					obj[`system.slots.${slot}.prepared`] = prepared.map(x => ({ ...x, expended }));
 					touched = true;
 				}
 			} else if (entry.isSpontaneous) {
-				if ((slotData.value ?? 0) > 0) {
-					obj[`system.slots.${slot}.value`] = 0;
+				const target = expended ? 0 : slotData.max;
+				if ((slotData.value ?? 0) !== target) {
+					obj[`system.slots.${slot}.value`] = target;
 					touched = true;
 				}
 			}
@@ -1151,7 +1161,12 @@ function _crossOutEssenceSlots(actor) {
 // settled case this can't see, e.g. a fresh page load with the pool long since at 0).
 function _onEssencePoolUpdate(feat) {
 	if (feat?.slug !== ESSENCE_POOL_SLUG || !feat.actor) return;
-	_restoreEssenceSlots(feat.actor, { force: true });
+	// In combat the slots must track the pool (cross out what it can't afford, restore
+	// what it can) — Magic+'s own in-combat pass has proven unreliable, so we run the
+	// same math ourselves on every pool update. Out of combat, force-restore as before
+	// (out-of-combat casting goes through Incantations, so nothing should be struck).
+	if (_actorInCombat(feat.actor)) _syncEssenceSlots(feat.actor);
+	else _restoreEssenceSlots(feat.actor, { force: true });
 }
 
 // Backstop: restore slots whenever an essence caster's sheet renders out of combat.
@@ -1202,8 +1217,8 @@ let _boundedEndHookId = null;
 
 registerTweak({
 	id: "boundedCombatStage",
-	name: "Bounded Essence: Combat Stage",
-	hint: "Automates the bounded-time draw stage for Bounded essence casters: sets it to 1st Draw when an encounter starts and back to Out of Essence when it ends (Magic+ already advances the stage on each cast).",
+	name: "Essence Draw Stage: Combat",
+	hint: "Automates the bounded-time draw stage for every caster that has the toggle — Bounded casters, Basic casters, and full essence casters below level 3 (pre-Essence Rebirth): sets it to 1st Draw when an encounter starts and back to Out of Essence when it ends (Magic+ already advances the stage on each cast).",
 	default: true,
 	onEnable() {
 		if (!_boundedStartHookId) {
@@ -1233,9 +1248,19 @@ function _onBoundedCombatEnd(combat) {
 	_setBoundedStageForCombat(combat, "0");
 }
 
-// GM-only: set each Bounded essence caster combatant's bounded-time stage, skipping
+// GM-only: set each essence caster combatant's bounded-time stage, skipping
 // any already on that stage. Mirrors Magic+'s own toggle call
 // (`toggleRollOption("all", "bounded-time", null, true, n)`).
+//
+// Gate on the TOGGLE being live (a `bounded-time:N` option is present), not on the
+// caster type: Magic+ predicates the toggle `{or:[essence-caster:bounded,
+// {lt:[self:level,3]}]}` (basic: always), so it covers bounded casters, basic casters,
+// AND full casters below level 3 — who, pre-Essence Rebirth, run the same one-shot
+// state machine (1st Draw -> Out of Essence ends their encounter). Gating on
+// essence-caster:bounded missed those low-level full casters entirely, leaving them
+// stuck on whatever stage they were last on. Full casters 3+ lose the toggle (Essence
+// Rebirth makes the cycle pool-driven), so the option vanishes and they're skipped
+// automatically — no level math to maintain here.
 //
 // A caster with no essence draw (flags.pf2e.essence-draw <= 0) must NOT be advanced
 // into a draw stage at combat start: arming 1st Draw would both suppress the
@@ -1247,7 +1272,7 @@ function _setBoundedStageForCombat(combat, stage) {
 	for (const combatant of combat.combatants) {
 		const actor = combatant.actor;
 		const opts = actor?.getRollOptions?.();
-		if (!opts?.includes(BOUNDED_CASTER_OPTION)) continue;
+		if (!opts?.some(o => o.startsWith(`${BOUNDED_TIME_OPTION}:`))) continue;
 		let target = stage;
 		if (target !== "0") {
 			const draw = Number(actor.flags?.pf2e?.["essence-draw"]) || 0;
