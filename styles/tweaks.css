@@ -248,3 +248,26 @@
 	opacity: 0.5;
 	cursor: not-allowed;
 }
+
+/* Life Essence reservoir readout on healing roll cards. Sits just under the dice
+   roll; scoped to .chat-message so it can't leak into sheets. */
+.chat-message .sky-reservoir-readout {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	margin-top: 4px;
+	padding: 3px 6px;
+	font-size: 0.9em;
+	font-weight: 600;
+	opacity: 0.9;
+	border-top: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+.chat-message .sky-reservoir-readout i {
+	color: #7a3ea8;
+}
+
+.chat-message .sky-reservoir-readout strong {
+	font-weight: 700;
+}

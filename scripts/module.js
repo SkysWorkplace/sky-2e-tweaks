@@ -2334,6 +2334,100 @@ registerTweak({
 });
 
 // =============================================================================
+// Tweak: Life Essence readout on heals
+//
+// Stamps a "Pool Remaining: N" line onto an essence caster's healing roll card, so
+// a player can see how much reservoir they have as they heal — without touching the
+// roll. The pool value is snapshotted at cast (preCreateChatMessage) and frozen into
+// a message flag, then injected on render.
+//
+// Freezing matters: the reservoir doesn't drain on this card. `reservoirRemoteSync`
+// spends it later, on the applied-healing card (possibly on another client), so
+// reading the pool live at render time would drift as the heal lands. The frozen
+// number is the pool "going in", matching the roll it sits beside.
+//
+// Detection reuses the reservoir's own qualifier (healing trait, not a cantrip) plus
+// "the caster has a life-essence resource", so the readout appears on exactly the
+// heals that interact with the reservoir. Display-only: no actor writes, no
+// libWrapper, no loop surface. (A Heal cast offensively vs. undead is still a
+// healing-trait damage roll, so it gets the line too even though that mode doesn't
+// drain the reservoir — accepted as a rare cosmetic edge, the number shown is still
+// the caster's true current pool.)
+// =============================================================================
+
+const RESERVOIR_READOUT_FLAG = "reservoirRemaining"; // frozen pool value at cast time
+let _reservoirReadoutCreateHookId = null;
+let _reservoirReadoutRenderHookId = null;
+
+// Resolve the casting actor for a chat message from its pf2e origin, and only if it
+// actually has a life-essence reservoir (otherwise there's nothing to read out).
+function _reservoirReadoutActor(message) {
+	const originUuid = message.flags?.pf2e?.origin?.actor;
+	const actor = originUuid ? fromUuidSync(originUuid) : (message.actor ?? null);
+	if (!actor?.getResource) return null;
+	return actor.getResource("life-essence") ? actor : null;
+}
+
+// Snapshot the pool at cast. preCreateChatMessage fires on the caster's client and
+// runs before the document is created, so updateSource embeds the flag with no extra
+// write. We only tag the healing *roll* card (context type "damage-roll").
+function _onReservoirReadoutPreCreate(message) {
+	if (message.flags?.pf2e?.context?.type !== "damage-roll") return; // the healing roll
+	if (!_reservoirHealQualifies(message.item)) return; // healing trait, not a cantrip
+	const actor = _reservoirReadoutActor(message);
+	if (!actor) return;
+	const value = actor.getResource("life-essence")?.value;
+	if (typeof value !== "number") return;
+	message.updateSource({ [`flags.${MODULE_ID}.${RESERVOIR_READOUT_FLAG}`]: value });
+}
+
+// Inject the frozen readout on render. DOM-only and idempotent (guarded on its own
+// class), re-applied every render — no document write, so no render loop.
+function _onReservoirReadoutRender(message, html) {
+	const value = message.flags?.[MODULE_ID]?.[RESERVOIR_READOUT_FLAG];
+	if (typeof value !== "number") return;
+	if (html.querySelector?.(".sky-reservoir-readout")) return; // already injected
+
+	const line = document.createElement("div");
+	line.className = "sky-reservoir-readout";
+	line.innerHTML = `<i class="fa-solid fa-droplet"></i> Pool Remaining: <strong>${value}</strong>`;
+
+	const diceRoll = html.querySelector?.(".dice-roll");
+	if (diceRoll) {
+		diceRoll.insertAdjacentElement("afterend", line);
+	} else {
+		const content = html.querySelector?.(".message-content");
+		if (!content) return;
+		content.appendChild(line);
+	}
+}
+
+registerTweak({
+	id: "reservoirReadout",
+	name: "Life Essence: Show Pool on Heals",
+	hint: "Adds a \"Pool Remaining: N\" line to an essence caster's healing roll cards, showing the Life Essence reservoir they had going into the heal. Display only — it doesn't change the roll or the pool.",
+	default: true,
+	onEnable() {
+		if (!_reservoirReadoutCreateHookId) {
+			_reservoirReadoutCreateHookId = Hooks.on("preCreateChatMessage", _onReservoirReadoutPreCreate);
+		}
+		if (!_reservoirReadoutRenderHookId) {
+			_reservoirReadoutRenderHookId = Hooks.on("renderChatMessageHTML", _onReservoirReadoutRender);
+		}
+	},
+	onDisable() {
+		if (_reservoirReadoutCreateHookId) {
+			Hooks.off("preCreateChatMessage", _reservoirReadoutCreateHookId);
+			_reservoirReadoutCreateHookId = null;
+		}
+		if (_reservoirReadoutRenderHookId) {
+			Hooks.off("renderChatMessageHTML", _reservoirReadoutRenderHookId);
+			_reservoirReadoutRenderHookId = null;
+		}
+	}
+});
+
+// =============================================================================
 // Tweak: Magic+ Aspect Fixes
 //
 // Patches two content bugs in Magic+'s Aspect spells, applied as each aspect item lands on
