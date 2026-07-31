@@ -2631,7 +2631,10 @@ function _buildAreaTrashAnchor() {
 	anchor.className = AREA_TRASH_CLASS;
 	// No data-action: pf2e-hud routes [data-action] clicks through ApplicationV2's own
 	// dispatcher, which complains about an action it doesn't know.
-	anchor.innerHTML = '<i class="fa-solid fa-trash"></i>';
+	// A broom, NOT a trashcan: pf2e-hud's menu already ends in a trash icon that clears
+	// the HOTBAR, and two trashcans in one column is a misread waiting to happen. The
+	// wide variant keeps a readable silhouette at the ~15px this renders at.
+	anchor.innerHTML = '<i class="fa-solid fa-broom-wide"></i>';
 	anchor.addEventListener("click", _onClickAreaTrash);
 	return anchor;
 }
