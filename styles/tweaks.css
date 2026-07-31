@@ -271,3 +271,29 @@
 .chat-message .sky-reservoir-readout strong {
 	font-weight: 700;
 }
+
+/* "Clear my spell areas" trashcan injected into PF2e HUD's persistent bar. Scoped to
+   the HUD element so it can't leak elsewhere. pf2e-hud already sizes any <i> inside
+   itself (--icon-width) and styles [data-panel="menu"] .group, so we only need to pin
+   the group and give the icon a cursor and a danger hover.
+
+   margin-top:auto keeps our group hugging the lock/mute group at the bottom of the
+   menu column: the menu is justify-content:space-between, and with no actor set the
+   only other child is .group.bottom — without this the trashcan would jump to the top
+   of the column the moment it appears. */
+#pf2e-hud-persistent [data-panel="menu"] .sky-area-trash-group {
+	margin-top: auto;
+}
+
+#pf2e-hud-persistent .sky-area-trash {
+	display: grid;
+	place-items: center;
+	cursor: pointer;
+	pointer-events: all;
+	color: var(--icon-color, #d4d7de);
+}
+
+#pf2e-hud-persistent .sky-area-trash:hover {
+	color: var(--color-active, #db2828);
+	text-shadow: 0 0 6px currentColor;
+}

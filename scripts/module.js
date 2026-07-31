@@ -2496,6 +2496,201 @@ function _onAspectItemCreated(item) {
 }
 
 // =============================================================================
+// Tweak: Clear My Spell Areas (PF2e HUD)
+//
+// PF2e's "clear template" trashcan lives on the chat card that placed the area, and
+// its visibility test is literally `region.message === message`
+// (toggleClearEffectAreaButton). Clear chat — or just lose the card in a long log —
+// and the area is stranded. For a player that's terminal, not merely annoying: the
+// Regions scene control is gated `visible: game.user.isGM`, so they have no canvas UI
+// to select their own area at all. The chat button is their only way out.
+//
+// So: a trashcan on PF2e HUD's persistent bar that clears the areas YOU placed on the
+// current scene, appearing only while you have some out.
+//
+// What we're actually deleting: in v14 PF2e, spell areas are **Region** documents, not
+// MeasuredTemplates (placeRegionFromItem). Everything needed is already on the document
+// — `ownership: {placerId: OWNER}`, `flags.pf2e.origin` (actor/item uuid), and
+// `flags.pf2e.areaShape` behind `region.isEffectArea` — so this is a pure read-the-scene
+// + delete feature with no state of its own. Core's Region metadata is `delete: "OWNER"`,
+// which is exactly why the placing player can remove their own.
+//
+// Injection seam: pf2e-hud ships minified with MANGLED class names (`class e extends…`),
+// so `renderPersistentPF2eHUD` is not a hook you can rely on. ApplicationV2 fires render
+// hooks for the whole inheritance chain, so we take the generic `renderApplicationV2` and
+// filter on the application id, which is a hard-coded string in pf2e-hud's source and
+// survives minification. If a future version renames it, this tweak degrades to "no icon
+// appears" — never to a broken HUD.
+// =============================================================================
+
+// Only the persistent bar. Two mounts were measured live before settling on the menu:
+//   - the sidebar icon row ([data-panel="sidebars"]) is a grid pinned to a fixed-width
+//     grid column (10.434em). It already carries six icons on a character, and a seventh
+//     lands exactly ON the row's right edge — outside the panel's border/background.
+//   - the token HUD's copy of that row is a hard `repeat(5, 1fr)`, so an extra icon drops
+//     onto a lone second row.
+// The menu column is a plain flex column of bordered groups that grows cleanly, and is the
+// one panel that renders with or without an actor — which is also the GM-with-nothing-
+// selected case. So: our own group in the menu, pinned just above the lock/mute/clear group
+// rather than inside it (two adjacent trashcans, one of which wipes your hotbar, is a
+// misclick waiting to happen).
+const AREA_TRASH_HUD_ID = "pf2e-hud-persistent";
+const AREA_TRASH_CLASS = "sky-area-trash";
+const AREA_TRASH_GROUP_CLASS = "sky-area-trash-group";
+
+let _areaTrashHookIds = null;
+let _areaTrashRefreshTimer = null;
+
+registerTweak({
+	id: "areaTrash",
+	name: "HUD: Clear My Spell Areas",
+	hint: "Adds a trashcan to PF2e HUD's persistent bar that deletes the spell areas (templates) you placed on the current scene, without needing the chat card. Only shows when you have areas out. GMs can shift-click to clear every effect area on the scene.",
+	default: true,
+	onEnable() {
+		if (_areaTrashHookIds) return;
+		_areaTrashHookIds = {
+			renderApplicationV2: Hooks.on("renderApplicationV2", _onRenderHudAreaTrash),
+			createRegion: Hooks.on("createRegion", _refreshAreaTrashSoon),
+			deleteRegion: Hooks.on("deleteRegion", _refreshAreaTrashSoon),
+			updateRegion: Hooks.on("updateRegion", _refreshAreaTrashSoon),
+			canvasReady: Hooks.on("canvasReady", _refreshAreaTrashSoon)
+		};
+		_refreshAreaTrash();
+	},
+	onDisable() {
+		if (_areaTrashHookIds) {
+			for (const [hook, id] of Object.entries(_areaTrashHookIds)) Hooks.off(hook, id);
+			_areaTrashHookIds = null;
+		}
+		if (_areaTrashRefreshTimer) {
+			clearTimeout(_areaTrashRefreshTimer);
+			_areaTrashRefreshTimer = null;
+		}
+		for (const el of document.querySelectorAll(`.${AREA_TRASH_GROUP_CLASS}`)) el.remove();
+	}
+});
+
+// A spell/ability area rather than a hand-drawn GM region. `isEffectArea` is PF2e's own
+// getter (one shape + an areaShape flag); fall back to the flag it reads so a system
+// refactor of the getter can't silently disable the tweak.
+function _isEffectArea(region) {
+	return region?.isEffectArea ?? !!region?.flags?.pf2e?.areaShape;
+}
+
+// "Mine" = I'm in the region's ownership map, which placeRegionFromItem writes for the
+// placing user only. Deliberately NOT `region.isOwner`: a GM is owner of every document,
+// so isOwner would make the GM's trashcan sweep up every player's area too.
+function _isMyArea(region) {
+	return _isEffectArea(region)
+		&& region.ownership?.[game.user.id] === CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER;
+}
+
+// Regions a click will actually delete. `all` (GM shift-click) widens to every effect area
+// on the scene. The canUserModify filter is not optional in either mode: a delete batch
+// containing one document the caller can't delete is rejected server-side but torn down
+// locally, stranding the region until a reload.
+function _areaTrashTargets(all = false) {
+	const regions = canvas?.scene?.regions;
+	if (!regions) return [];
+	return regions.filter(r => (all ? _isEffectArea(r) : _isMyArea(r))
+		&& r.canUserModify(game.user, "delete"));
+}
+
+function _areaTrashTooltip(mine) {
+	const names = [...new Set(mine.map(r => r.name || "Area"))];
+	const list = names.slice(0, 6).join(", ") + (names.length > 6 ? ", …" : "");
+	const lines = [`Clear my spell areas (${mine.length}): ${list}`];
+	if (game.user.isGM) lines.push("Shift-click: clear every effect area on this scene.");
+	return lines.join("<br>");
+}
+
+function _onRenderHudAreaTrash(app, element) {
+	if (app?.id !== AREA_TRASH_HUD_ID) return;
+	_injectAreaTrash(element instanceof HTMLElement ? element : element?.[0]);
+}
+
+// Our own `.group` in the menu column. pf2e-hud styles `[data-panel="menu"] .group`
+// generically, so the injected div picks up the same padding/border/background as the
+// native groups for free.
+function _areaTrashGroup(root, create = false) {
+	const menu = root.querySelector('[data-panel="menu"]');
+	if (!menu) return null;
+	let group = menu.querySelector(`.${AREA_TRASH_GROUP_CLASS}`);
+	if (!group && create) {
+		group = document.createElement("div");
+		group.className = `group ${AREA_TRASH_GROUP_CLASS}`;
+		const bottom = menu.querySelector(".group.bottom");
+		if (bottom) menu.insertBefore(group, bottom);
+		else menu.append(group);
+	}
+	return group;
+}
+
+function _buildAreaTrashAnchor() {
+	const anchor = document.createElement("a");
+	anchor.className = AREA_TRASH_CLASS;
+	// No data-action: pf2e-hud routes [data-action] clicks through ApplicationV2's own
+	// dispatcher, which complains about an action it doesn't know.
+	anchor.innerHTML = '<i class="fa-solid fa-trash"></i>';
+	anchor.addEventListener("click", _onClickAreaTrash);
+	return anchor;
+}
+
+// Idempotent, and re-run on every HUD render because _replaceHTML rebuilds the whole
+// element's innerHTML each time.
+function _injectAreaTrash(root) {
+	if (!root?.querySelectorAll) return;
+	const existing = root.querySelector(`.${AREA_TRASH_CLASS}`);
+	const mine = _areaTrashTargets();
+	if (!mine.length) {
+		// Take the whole group with it — an empty bordered box is worse than no icon.
+		_areaTrashGroup(root)?.remove();
+		return;
+	}
+	const anchor = existing ?? _buildAreaTrashAnchor();
+	anchor.dataset.tooltip = _areaTrashTooltip(mine);
+	if (!existing) {
+		const group = _areaTrashGroup(root, true);
+		if (!group) return;
+		group.append(anchor);
+	}
+}
+
+async function _onClickAreaTrash(event) {
+	event.preventDefault();
+	// Keep the click out of pf2e-hud's own sidebar/action handling.
+	event.stopPropagation();
+
+	const scene = canvas?.scene;
+	if (!scene) return;
+	const all = event.shiftKey && game.user.isGM;
+	const targets = _areaTrashTargets(all);
+	if (!targets.length) return;
+
+	try {
+		await scene.deleteEmbeddedDocuments("Region", targets.map(r => r.id));
+	} catch (err) {
+		ui.notifications.warn(`Couldn't clear spell areas: ${err.message}`);
+	}
+	_refreshAreaTrash();
+}
+
+// One refresh per batch: deleting five regions fires five hooks, and the documents leave
+// the collection around the same tick, so coalesce onto the next macrotask.
+function _refreshAreaTrashSoon() {
+	if (_areaTrashRefreshTimer) return;
+	_areaTrashRefreshTimer = setTimeout(() => {
+		_areaTrashRefreshTimer = null;
+		_refreshAreaTrash();
+	}, 0);
+}
+
+function _refreshAreaTrash() {
+	const root = document.getElementById(AREA_TRASH_HUD_ID);
+	if (root) _injectAreaTrash(root);
+}
+
+// =============================================================================
 // Core setup
 // =============================================================================
 
