@@ -297,3 +297,10 @@
 	color: var(--color-active, #db2828);
 	text-shadow: 0 0 6px currentColor;
 }
+
+/* Necromancer: Undead, Arise! — card button */
+.sky-arise {
+	display: block;
+	width: 100%;
+	margin-top: 6px;
+}

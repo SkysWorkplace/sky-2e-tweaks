@@ -2694,6 +2694,543 @@ function _refreshAreaTrash() {
 }
 
 // =============================================================================
+// Tweak: Magic+ Journal Link Repair
+//
+// 92% of the links in the Magic+ journal (487 of 532) are dead in a PF2e world.
+//
+// The root cause is in Magic+'s own module.json: `journals` is the ONE pack declared
+// with no `system` key, so a single shared journal serves both PF2e and SF2e worlds —
+// while every content pack IS scoped (`items`/`misc`/`actors` to pf2e, `sf2e-items`/
+// `sf2e-misc`/`sf2e-actors` to sf2e). Magic+ 1.3.4 ("Applied missing previous updates
+// to the SF2e compendiums") regenerated that shared journal from the SF2e side, so its
+// links now point at packs Foundry filters out of a PF2e world entirely, plus `sf2e.*`
+// system packs that aren't installed at all. It re-breaks what their own 1.3.1 fixed
+// ("Fixed UUIDs not working on the PF2e system").
+//
+// We repair at enrich time rather than rewriting the compendium: that pack is
+// unversioned on disk and the next Magic+ release would wipe a pack edit — and may
+// well fix this upstream, at which point this tweak just stops matching anything.
+//
+// Three of the four cases are pure pack renames: the PF2e and SF2e packs are built from
+// the same source with identical document IDs. Verified live — all 388 such links resolve
+// by ID into `items`/`misc`, with 150 labels cross-checked against the target document
+// names and zero mismatches. The fourth case (`sf2e.*` system packs) can't work that way,
+// because IDs do NOT carry across systems, so we match on the link's own label text.
+//
+// Two UUID formats are in play and both must be handled or the fix silently does half the
+// job: 310 links use the legacy 3-part `Compendium.<scope>.<pack>.<id>` form and 221 the
+// modern `Compendium.<scope>.<pack>.<Type>.<id>` form — `sf2e-items` alone is split 220/125.
+// The pack renames only touch the scope+pack prefix, so they cover both; the sf2e matcher
+// treats the document-type segment as optional and emits the modern form.
+//
+// Measured on the live journal: 487 broken -> 2. Both survivors are out of scope — one link
+// to `witches-remaster` (a module that isn't installed) and one relative `.<pageId>#anchor`
+// link, an upstream idiom Inventors+ uses too.
+// =============================================================================
+
+const ENRICH_TARGET = "foundry.applications.ux.TextEditor.implementation.enrichHTML";
+
+// Prefix rewrites. Only the scope+pack segments change, so these apply to both UUID forms.
+const MP_PACK_RENAMES = [
+	["Compendium.pf2e-team-plus-magic.sf2e-items.", "Compendium.pf2e-team-plus-magic.items."],
+	["Compendium.pf2e-team-plus-magic.sf2e-misc.", "Compendium.pf2e-team-plus-magic.misc."],
+	// Pre-rebrand module id, from before Wizards+ became Team+ Wizards.
+	["Compendium.pf2e-wizards-plus.wizards-player-options.", "Compendium.pf2e-team-plus-wizards.wizards-player-options."]
+];
+
+// SF2e system pack -> PF2e equivalent. All five destinations are Item packs.
+const MP_SF2E_PACKS = {
+	"spells": "pf2e.spells-srd",
+	"conditions": "pf2e.conditionitems",
+	"actions": "pf2e.actionspf2e",
+	"feats": "pf2e.feats-srd",
+	"bestiary-ability-glossary-srd": "pf2e.bestiary-ability-glossary-srd"
+};
+
+// Document type is optional (legacy links omit it); a label is required, since the label is
+// the only thing carrying the identity across systems.
+const MP_SF2E_LINK = /@UUID\[Compendium\.sf2e\.([a-z0-9-]+)\.(?:[A-Za-z]+\.)?([A-Za-z0-9]+)\]\{([^}]*)\}/g;
+
+let _mpNameIndexCache = null;
+
+// Lazily build (and cache) a name -> id index for a destination pack. Built on first use
+// rather than at ready so a world without Magic+ never pays for it.
+function _mpNameIndex(collection) {
+	_mpNameIndexCache ??= new Map();
+	let idx = _mpNameIndexCache.get(collection);
+	if (!idx) {
+		const pack = game.packs.get(collection);
+		idx = pack ? new Map(pack.index.contents.map(e => [e.name.toLowerCase(), e._id])) : new Map();
+		_mpNameIndexCache.set(collection, idx);
+	}
+	return idx;
+}
+
+// Loosen a link label to a pack document name. Two shapes need it: rank-suffixed conditions
+// ("Stupefied 1" -> "Stupefied") and parenthetical qualifiers ("Divine Decree (unholy only)").
+function _mpNormalizeLabel(label) {
+	return label.toLowerCase().replace(/\([^)]*\)/g, "").replace(/\s+\d+$/, "").replace(/\s+/g, " ").trim();
+}
+
+// Cheap bail-out for the enrich hot path: almost no text in the world contains these.
+function _mpNeedsLinkFix(text) {
+	return typeof text === "string"
+		&& (text.includes(".sf2e-items.") || text.includes(".sf2e-misc.")
+			|| text.includes("Compendium.sf2e.") || text.includes("pf2e-wizards-plus"));
+}
+
+function _mpRepairLinks(text) {
+	let out = text;
+	for (const [from, to] of MP_PACK_RENAMES) out = out.split(from).join(to);
+
+	return out.replace(MP_SF2E_LINK, (match, pack, _id, label) => {
+		const dest = MP_SF2E_PACKS[pack];
+		if (!dest) return match;
+		const idx = _mpNameIndex(dest);
+		// Exact name first, then the loosened form — exact is the more precise claim.
+		const hit = idx.get(label.toLowerCase().trim()) ?? idx.get(_mpNormalizeLabel(label));
+		return hit ? `@UUID[Compendium.${dest}.Item.${hit}]{${label}}` : match;
+	});
+}
+
+function _mpWrapEnrich(wrapped, content, ...args) {
+	if (_mpNeedsLinkFix(content)) content = _mpRepairLinks(content);
+	return wrapped(content, ...args);
+}
+
+registerTweak({
+	id: "magicPlusJournalLinks",
+	name: "Magic+ Journal Link Repair",
+	hint: "Repairs the Magic+ journal, where 92% of links (487 of 532) are dead because Magic+ 1.3.4 rebuilt its shared PF2e/SF2e journal pointing at SF2e compendiums that don't exist in a PF2e world. Rewrites those links as the text renders — nothing on disk is modified, so a Magic+ update can't undo it, and this quietly does nothing once upstream fixes the journal. Two links stay broken by design: one needs the Witches Remaster module, and one is a malformed relative link.",
+	default: true,
+	onEnable() {
+		if (!game.modules.get(MAGICPLUS_ID)?.active) return;
+		if (typeof libWrapper !== "function") {
+			console.error(`${MODULE_ID} | libWrapper is not active — the Magic+ Journal Link Repair tweak cannot function. Install and enable the libWrapper module.`);
+			ui.notifications?.error("Sky's 2e Tweaks: the libWrapper module is required for the Magic+ Journal Link Repair tweak but isn't active.");
+			return;
+		}
+		libWrapper.register(MODULE_ID, ENRICH_TARGET, _mpWrapEnrich, "WRAPPER");
+	},
+	onDisable() {
+		if (typeof libWrapper === "function") libWrapper.unregister(MODULE_ID, ENRICH_TARGET, false);
+		_mpNameIndexCache = null;
+	}
+});
+
+// =============================================================================
+// Tweak: Clear Scene & Reset Fog
+//
+// A random-encounter scene gets reused constantly — drop combatants, fight, wipe,
+// repeat — and resetting it by hand is two chores in a fixed order.
+//
+// THE ORDER IS THE WHOLE POINT. Fog must be reset with no vision sources left on the
+// scene: reset first and any surviving token re-explores its radius the instant the
+// reset lands, so the wipe looks like it silently failed. Tokens out, then fog.
+//
+// Lives in the TOKEN controls because `canvas.fog.reset()` only emits `resetFog` for
+// `canvas.scene` — it can only ever act on the scene being viewed, and a toolbar
+// button is the one surface where that is always true. A Scenes-sidebar entry would
+// have to delete FogExploration documents by hand for any scene that isn't in view.
+// =============================================================================
+
+const CLEAR_SCENE_TOOL = "sky-2e-clear-scene";
+let _clearSceneHookId = null;
+
+function _clearSceneToolDef() {
+	return {
+		name: CLEAR_SCENE_TOOL,
+		// After sky-hexcrawl's 98/99 — this is scene housekeeping, not part of that group.
+		order: 100,
+		title: "Clear Scene & Reset Fog",
+		icon: "fa-solid fa-eraser",
+		button: true,
+		onChange: () => _clearSceneAndFog()
+	};
+}
+
+function _onGetSceneControlsClearScene(controls) {
+	if (!game.user.isGM) return;
+	if (controls?.tokens?.tools) controls.tokens.tools[CLEAR_SCENE_TOOL] = _clearSceneToolDef();
+}
+
+// `getSceneControlButtons` fires EXACTLY ONCE. Core's own comment on #prepareControls: "This is
+// only done once when the application is first rendered. Subsequent renders reuse this data
+// structure." So the hook alone can't be the whole story — a hook registered at `ready`, or when
+// this tweak is switched on from the settings menu, has already missed its only chance, and
+// `ui.controls.render()` will not give it another (measured: the tool never appeared). Pushing the
+// tool straight into the live record is what makes toggling work without a reload; the hook covers
+// the case where the toolbar hasn't been built yet.
+function _syncClearSceneTool(present) {
+	const tools = ui.controls?.controls?.tokens?.tools;
+	if (!tools) return;
+	if (present) tools[CLEAR_SCENE_TOOL] = _clearSceneToolDef();
+	else delete tools[CLEAR_SCENE_TOOL];
+	ui.controls.render();
+}
+
+async function _clearSceneAndFog() {
+	const scene = canvas?.scene;
+	if (!scene) return;
+
+	// The same filter the area trash needed: a delete batch containing one document the
+	// caller can't delete is rejected server-side but torn down locally, stranding the
+	// token until a reload. A GM can normally delete everything, so this should be a
+	// no-op — but when it isn't, the count in the dialog is the honest one.
+	const doomed = scene.tokens.filter(t => t.canUserModify(game.user, "delete"));
+	const skipped = scene.tokens.size - doomed.length;
+
+	const esc = foundry.utils.escapeHTML;
+	const confirmed = await foundry.applications.api.DialogV2.confirm({
+		window: { title: "Clear Scene & Reset Fog", icon: "fa-solid fa-eraser" },
+		content: `
+			<p>On <strong>${esc(scene.name)}</strong>:</p>
+			<ol>
+				<li>Delete <strong>${doomed.length}</strong> token${doomed.length === 1 ? "" : "s"} — <em>every</em> token, party included.</li>
+				<li>Reset Fog of War.</li>
+			</ol>
+			${skipped ? `<p><strong>${skipped}</strong> token${skipped === 1 ? "" : "s"} will be left behind — you can't delete ${skipped === 1 ? "it" : "them"}.</p>` : ""}
+			<p><strong>Deleting tokens cannot be undone.</strong></p>`,
+		// Dismissal resolves null rather than throwing; `no` is already the default button,
+		// so Escape and Enter both back out of a destructive action.
+		rejectClose: false
+	});
+	if (!confirmed) return;
+
+	if (doomed.length) {
+		try {
+			await scene.deleteEmbeddedDocuments("Token", doomed.map(t => t.id));
+		} catch (err) {
+			// Bail without touching fog. A half-done wipe — fog reset under a scene still
+			// full of tokens — is worse than one that plainly didn't run.
+			ui.notifications.error(`Couldn't clear the scene: ${err.message}`);
+			console.error(`${MODULE_ID} | clear scene failed`, err);
+			return;
+		}
+		ui.notifications.info(`Cleared ${doomed.length} token${doomed.length === 1 ? "" : "s"} from ${scene.name}.`);
+	}
+
+	// Core posts its own "Fog of War exploration progress was reset" toast, so this stays quiet.
+	await canvas.fog.reset();
+}
+
+registerTweak({
+	id: "clearSceneAndFog",
+	name: "Token Toolbar: Clear Scene & Reset Fog",
+	hint: "Adds an eraser button to the Token controls (GM only) that deletes every token on the current scene and then resets its Fog of War, in that order — resetting fog first would just let the surviving tokens re-explore it. Built for a reusable random-encounter map. Asks for confirmation and shows the token count first, because deleting tokens cannot be undone.",
+	default: true,
+	onEnable() {
+		// Client-scoped setting, so a player could have it on; the button is GM-only regardless.
+		if (!game.user.isGM || _clearSceneHookId) return;
+		_clearSceneHookId = Hooks.on("getSceneControlButtons", _onGetSceneControlsClearScene);
+		_syncClearSceneTool(true);
+	},
+	onDisable() {
+		if (_clearSceneHookId) {
+			Hooks.off("getSceneControlButtons", _clearSceneHookId);
+			_clearSceneHookId = null;
+		}
+		_syncClearSceneTool(false);
+	}
+});
+
+// =============================================================================
+// Tweak: Necromancer — Undead, Arise!
+//
+// The NPC-Core necromancer's "Undead, Arise!" summons two Medium undead entities into
+// different empty squares within 30 feet, and keeps at most four: calling more makes the
+// oldest deteriorate. The GM gets a button on that action's chat card. It asks for a
+// form (zombie/skeleton/ghost), highlights the legal squares, and takes two clicks to
+// place them. Right-click or Esc cancels.
+//
+// The entities are world actors flagged `flags.sky-2e-tweaks.undeadEntity = <form>`
+// (found by flag, so renaming them or changing their art is safe). They have 1 HP and a
+// +15 / 2d12 no-MAP strike for "Undead, Attack!". AC and saves are copied from the
+// necromancer's own at summon time, into the token delta.
+//
+// "Oldest" is tracked by an order stamp on the token, scoped to the summoning token's id,
+// so two necromancers on one scene keep separate counts. Entities already at 0 HP don't
+// count toward the four.
+//
+// Scope is Arise only. Attack is rolled from each entity's sheet, while Wave of Death and
+// the 0-HP deterioration stay manual.
+// =============================================================================
+
+const ARISE_ITEM_NAME = /^undead,?\s*arise\b/i;
+const ENTITY_FLAG = "undeadEntity";      // actor flag: "zombie" | "skeleton" | "ghost"
+const ENTITY_OF_FLAG = "entityOf";       // token flag: the summoning necromancer's token id
+const ENTITY_ORDER_FLAG = "entityOrder"; // token flag: summon order, oldest deteriorates first
+const ARISE_COUNT = 2;
+const ARISE_RANGE = 30;
+const ARISE_MAX = 4;
+const ARISE_HIGHLIGHT = "sky-2e-tweaks-arise";
+const ARISE_PICKED = "sky-2e-tweaks-arise-picked";
+const ARISE_HOVER = "sky-2e-tweaks-arise-hover";
+const ARISE_FORMS = [
+	{ form: "zombie", label: "Zombie" },
+	{ form: "skeleton", label: "Skeleton" },
+	{ form: "ghost", label: "Ghost (spirit)" }
+];
+
+let _ariseRenderHookId = null;
+let _arisePicking = false;
+
+registerTweak({
+	id: "necromancerArise",
+	name: "Necromancer: Undead, Arise!",
+	hint: "Adds a \"Raise Undead\" button (GM only) to the chat card of a necromancer NPC's Undead, Arise! action. Pick a form, then click two highlighted empty squares within 30 feet. The entities copy the necromancer's AC and saves, and once there are more than four, the oldest are removed. Needs the Undead Entity actors (flagged zombie/skeleton/ghost) in the world.",
+	default: true,
+	onEnable() {
+		if (_ariseRenderHookId) return;
+		_ariseRenderHookId = Hooks.on("renderChatMessageHTML", _onRenderAriseCard);
+	},
+	onDisable() {
+		if (_ariseRenderHookId) {
+			Hooks.off("renderChatMessageHTML", _ariseRenderHookId);
+			_ariseRenderHookId = null;
+		}
+	}
+});
+
+function _onRenderAriseCard(message, html) {
+	if (!game.user.isGM) return;
+	const item = message.item;
+	if (item?.type !== "action" || !ARISE_ITEM_NAME.test(item.name)) return;
+	if (html.querySelector(".sky-arise")) return;
+	const anchor = html.querySelector(".card-content") ?? html.querySelector(".message-content");
+	if (!anchor) return;
+	const btn = document.createElement("button");
+	btn.type = "button";
+	btn.className = "sky-arise";
+	btn.innerHTML = `<i class="fa-solid fa-skull"></i> Raise ${ARISE_COUNT} Undead`;
+	btn.addEventListener("click", ev => {
+		ev.preventDefault();
+		ev.stopPropagation();
+		_undeadArise(message);
+	});
+	anchor.append(btn);
+}
+
+async function _undeadArise(message) {
+	if (_arisePicking) return ui.notifications.warn("Already placing undead. Finish, or press Esc.");
+	const necro = _ariseNecromancerToken(message);
+	if (!necro) return;
+
+	const form = await _promptEntityForm(necro.name);
+	if (!form) return;
+	const entityActor = game.actors.find(a => a.getFlag(MODULE_ID, ENTITY_FLAG) === form);
+	if (!entityActor) {
+		return ui.notifications.error(`No world actor is flagged as a ${form} undead entity (flags.${MODULE_ID}.${ENTITY_FLAG} = "${form}").`);
+	}
+
+	const squares = await _pickAriseSquares(necro);
+	if (!squares) return;
+
+	// Count only live entities toward the cap; a 0-HP one left on the map is already gone.
+	const existing = _entitiesOf(necro.document).filter(t => (t.actor?.hitPoints?.value ?? 0) > 0);
+	const lastOrder = _entitiesOf(necro.document).at(-1)?.getFlag(MODULE_ID, ENTITY_ORDER_FLAG) ?? 0;
+	const overflow = existing.length + squares.length - ARISE_MAX;
+	const doomed = overflow > 0 ? existing.slice(0, overflow) : [];
+	const defenses = _necroDefenses(necro.actor);
+
+	try {
+		const data = await Promise.all(squares.map(async (tl, i) => {
+			const doc = await entityActor.getTokenDocument({
+				x: tl.x,
+				y: tl.y,
+				delta: { system: defenses },
+				flags: { [MODULE_ID]: { [ENTITY_OF_FLAG]: necro.document.id, [ENTITY_ORDER_FLAG]: lastOrder + 1 + i } }
+			});
+			return doc.toObject();
+		}));
+		if (doomed.length) await canvas.scene.deleteEmbeddedDocuments("Token", doomed.map(t => t.id));
+		await canvas.scene.createEmbeddedDocuments("Token", data);
+	} catch (err) {
+		ui.notifications.error(`Couldn't raise the undead: ${err.message}`);
+		console.error(`${MODULE_ID} | Undead, Arise! failed`, err);
+		return;
+	}
+
+	const gone = doomed.length ? ` ${doomed.length} older ${doomed.length === 1 ? "entity deteriorates" : "entities deteriorate"}.` : "";
+	ui.notifications.info(`${necro.name} raises ${squares.length} undead.${gone}`);
+}
+
+function _ariseNecromancerToken(message) {
+	const { scene, token } = message.speaker ?? {};
+	if (!token) {
+		ui.notifications.warn("This card wasn't posted from a token, so there's no necromancer to measure 30 feet from.");
+		return null;
+	}
+	if (scene !== canvas.scene?.id) {
+		ui.notifications.warn("View the scene the necromancer is on to raise undead there.");
+		return null;
+	}
+	const obj = canvas.scene.tokens.get(token)?.object;
+	if (!obj?.actor) {
+		ui.notifications.warn("The necromancer's token is no longer on this scene.");
+		return null;
+	}
+	return obj;
+}
+
+// The rule says "the same AC and saves as the necromancer", which means his stat block.
+// Taken from source so a frightened or off-guard necromancer doesn't pass that onto
+// his entities, but with the Elite/Weak adjustment, which is part of the stat block.
+function _necroDefenses(actor) {
+	const src = actor._source.system;
+	const adj = actor.isElite ? 2 : actor.isWeak ? -2 : 0;
+	return {
+		attributes: { ac: { value: src.attributes.ac.value + adj } },
+		saves: Object.fromEntries(["fortitude", "reflex", "will"].map(s => [s, { value: src.saves[s].value + adj }]))
+	};
+}
+
+// This necromancer's entities on the current scene, oldest first.
+function _entitiesOf(necroDoc) {
+	const order = t => t.getFlag(MODULE_ID, ENTITY_ORDER_FLAG) ?? 0;
+	return canvas.scene.tokens
+		.filter(t => t.getFlag(MODULE_ID, ENTITY_OF_FLAG) === necroDoc.id)
+		.sort((a, b) => order(a) - order(b));
+}
+
+async function _promptEntityForm(necroName) {
+	try {
+		const result = await foundry.applications.api.DialogV2.wait({
+			window: { title: "Undead, Arise!" },
+			position: { width: 380 },
+			content: `<p>What form do <strong>${foundry.utils.escapeHTML(necroName)}</strong>'s ${ARISE_COUNT} entities take?</p>`,
+			buttons: ARISE_FORMS.map(({ form, label }) => ({ action: form, label, callback: () => form })),
+			rejectClose: false
+		});
+		return ARISE_FORMS.some(f => f.form === result) ? result : null;
+	} catch {
+		return null;
+	}
+}
+
+// Legal squares: empty (no token covering its centre), on the scene, and within range of
+// the nearest square the necromancer occupies. Range uses the scene's own diagonal
+// rule via measurePath, which gives PF2e's alternating 5/10 feet.
+function _ariseCandidates(necro) {
+	const grid = canvas.grid;
+	const size = grid.size;
+	const reach = Math.ceil(ARISE_RANGE / grid.distance);
+	const base = grid.getTopLeftPoint({ x: necro.document.x + 1, y: necro.document.y + 1 });
+	const w = Math.max(1, Math.round(necro.document.width));
+	const h = Math.max(1, Math.round(necro.document.height));
+	const origins = [];
+	for (let i = 0; i < w; i++) for (let j = 0; j < h; j++) {
+		origins.push({ x: base.x + (i + 0.5) * size, y: base.y + (j + 0.5) * size });
+	}
+	const sceneRect = canvas.dimensions.sceneRect;
+	const blockers = canvas.tokens.placeables.map(t => t.bounds);
+
+	const valid = new Map();
+	for (let i = -reach; i < w + reach; i++) for (let j = -reach; j < h + reach; j++) {
+		const tl = { x: base.x + i * size, y: base.y + j * size };
+		const c = { x: tl.x + size / 2, y: tl.y + size / 2 };
+		if (!sceneRect.contains(c.x, c.y)) continue;
+		if (blockers.some(b => b.contains(c.x, c.y))) continue;
+		const dist = Math.min(...origins.map(o => grid.measurePath([o, c]).distance));
+		if (dist > ARISE_RANGE) continue;
+		valid.set(`${tl.x},${tl.y}`, tl);
+	}
+	return valid;
+}
+
+// Resolves to an array of ARISE_COUNT top-left points, or null if cancelled. Listens in
+// the capture phase on window, so the clicks never reach Foundry's canvas handlers
+// (no deselecting, no drag-box, no panning on right-click).
+function _pickAriseSquares(necro) {
+	const valid = _ariseCandidates(necro);
+	if (valid.size < ARISE_COUNT) {
+		ui.notifications.warn(`There aren't ${ARISE_COUNT} empty squares within ${ARISE_RANGE} feet of ${necro.name}.`);
+		return Promise.resolve(null);
+	}
+
+	const layer = canvas.interface.grid;
+	layer.addHighlightLayer(ARISE_HIGHLIGHT);
+	for (const tl of valid.values()) {
+		layer.highlightPosition(ARISE_HIGHLIGHT, { x: tl.x, y: tl.y, color: 0x6b3fa0, alpha: 0.25 });
+	}
+	ui.notifications.info(`Click ${ARISE_COUNT} highlighted squares. Right-click or Esc cancels.`);
+	_arisePicking = true;
+
+	// Picked and hover each need their own layer. A highlight layer silently refuses a square
+	// it already holds (GridHighlight#highlight dedupes by position), so re-colouring a
+	// range square on the same layer is a no-op. Added in draw order: range, picked, hover.
+	layer.addHighlightLayer(ARISE_PICKED);
+	layer.addHighlightLayer(ARISE_HOVER);
+
+	return new Promise(resolve => {
+		const picked = [];
+		const pickedKeys = new Set();
+		const view = canvas.app.view;
+		let hoverKey = null;
+		const finish = result => {
+			window.removeEventListener("pointerdown", onDown, true);
+			window.removeEventListener("pointermove", onMove, true);
+			window.removeEventListener("contextmenu", onContext, true);
+			window.removeEventListener("keydown", onKey, true);
+			Hooks.off("canvasTearDown", teardownId);
+			layer.destroyHighlightLayer(ARISE_HIGHLIGHT);
+			layer.destroyHighlightLayer(ARISE_PICKED);
+			layer.destroyHighlightLayer(ARISE_HOVER);
+			_arisePicking = false;
+			resolve(result);
+		};
+		// White on a legal square, red on anything else; picked squares keep their own mark.
+		const onMove = ev => {
+			if (ev.target !== view) {
+				if (hoverKey !== null) layer.clearHighlightLayer(ARISE_HOVER);
+				hoverKey = null;
+				return;
+			}
+			const tl = canvas.grid.getTopLeftPoint(canvas.canvasCoordinatesFromClient({ x: ev.clientX, y: ev.clientY }));
+			const key = `${tl.x},${tl.y}`;
+			if (key === hoverKey) return;
+			hoverKey = key;
+			layer.clearHighlightLayer(ARISE_HOVER);
+			if (pickedKeys.has(key)) return;
+			const color = valid.has(key) ? 0xffffff : 0xcc3333;
+			layer.highlightPosition(ARISE_HOVER, { x: tl.x, y: tl.y, color, border: color, alpha: 0.35 });
+		};
+		const onDown = ev => {
+			if (ev.target !== view) return;
+			ev.preventDefault();
+			ev.stopImmediatePropagation();
+			if (ev.button === 2) return finish(null);
+			if (ev.button !== 0) return;
+			const tl = canvas.grid.getTopLeftPoint(canvas.canvasCoordinatesFromClient({ x: ev.clientX, y: ev.clientY }));
+			const key = `${tl.x},${tl.y}`;
+			if (!valid.has(key)) {
+				return ui.notifications.warn(`Pick an empty highlighted square within ${ARISE_RANGE} feet.`);
+			}
+			valid.delete(key); // "different empty squares"
+			picked.push(tl);
+			pickedKeys.add(key);
+			layer.clearHighlightLayer(ARISE_HOVER);
+			layer.highlightPosition(ARISE_PICKED, { x: tl.x, y: tl.y, color: 0xb388ff, border: 0xffffff, alpha: 0.7 });
+			if (picked.length >= ARISE_COUNT) finish(picked);
+		};
+		const onContext = ev => {
+			if (ev.target === view) ev.preventDefault();
+		};
+		const onKey = ev => {
+			if (ev.key !== "Escape") return;
+			ev.preventDefault();
+			ev.stopImmediatePropagation();
+			finish(null);
+		};
+		const teardownId = Hooks.once("canvasTearDown", () => finish(null));
+		window.addEventListener("pointerdown", onDown, true);
+		window.addEventListener("pointermove", onMove, true);
+		window.addEventListener("contextmenu", onContext, true);
+		window.addEventListener("keydown", onKey, true);
+	});
+}
+
+// =============================================================================
 // Core setup
 // =============================================================================
 
