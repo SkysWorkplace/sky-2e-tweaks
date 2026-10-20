@@ -3,7 +3,7 @@
 		{{#each tweaks}}
 		<div class="sky-tweak-row">
 			<div class="sky-tweak-toggle">
-				<input type="checkbox" name="tweaks.{{id}}" id="tweak-{{id}}" {{#if enabled}}checked{{/if}}>
+				<input type="checkbox" name="tweaks.{{id}}" id="tweak-{{id}}" {{#if enabled}}checked{{/if}} {{#if locked}}disabled title="GM only"{{/if}}>
 			</div>
 			<label for="tweak-{{id}}" class="sky-tweak-info">
 				<span class="sky-tweak-name">{{name}}</span>

@@ -13,6 +13,7 @@ const TWEAKS = [];
  * @param {boolean} [tweak.default=true] - Default enabled state
  * @param {Function} [tweak.onEnable] - Called when tweak is active at ready time
  * @param {Function} [tweak.onDisable] - Called when tweak is toggled off (if cleanup needed)
+ * @param {"client"|"world"} [tweak.scope="client"] - "world" = GM-only toggle shared by every client
  */
 export function registerTweak(tweak) {
 	TWEAKS.push(tweak);
@@ -3231,6 +3232,141 @@ function _pickAriseSquares(necro) {
 }
 
 // =============================================================================
+// Tweak: Alchemist Martial Weapon Progression (house rule)
+//
+// RAW the Alchemist lags every other martial: expert simple/unarmed/bombs at 7,
+// master at 15, Weapon Specialization at 13 — vs expert 5 / master 13 / spec 7 for
+// Barbarian, Rogue, Investigator et al. This moves the Alchemist onto that track.
+//
+// Pure data prep, ZERO document writes (see feedback_foundry_no_update_loops). We
+// wrap the class item's prepareActorData, which runs once per actor prep after the
+// class sets its base ranks and BEFORE rule elements apply their ActiveEffectLikes:
+//   - Proficiency: raise simple/unarmed/bomb ranks by level. Every writer uses
+//     max(), so the native AELs at 7/15 and any manual sheet rank still win if higher.
+//   - Weapon Specialization at 7: push a synthetic damage modifier that mirrors the
+//     core feature's rules (+2/+3/+4 by item proficiency rank, gated on expert+).
+//     Skipped once the actor owns the real feature (granted at 13), so it never doubles.
+// Synthetics are rebuilt in Actor#_initialize on every prep, so the push can't pile up.
+//
+// World-scoped: derived data is computed per client, so a client-scoped toggle would
+// let the GM and a player see different attack bonuses for the same character.
+// =============================================================================
+
+const ALCH_CLASS_PREP_TARGET = "CONFIG.PF2E.Item.documentClasses.class.prototype.prepareActorData";
+const ALCH_BOMB_KEY = "weapon-base-alchemical-bomb";
+const ALCH_SPEC_SLUG = "weapon-specialization";
+let _alchWrapped = false;
+
+function _alchTargetRank(level) {
+	if (level >= 13) return 3;
+	if (level >= 5) return 2;
+	return 0;
+}
+
+function _alchWrapPrepareActorData(wrapped, ...args) {
+	const result = wrapped(...args);
+	try {
+		_alchApplyProgression(this);
+	} catch (err) {
+		console.error(`${MODULE_ID} | Alchemist progression failed for ${this.actor?.name}`, err);
+	}
+	return result;
+}
+
+function _alchApplyProgression(classItem) {
+	const actor = classItem.actor;
+	if (!actor?.isOfType("character") || classItem.slug !== "alchemist") return;
+	const level = actor.level;
+	const rank = _alchTargetRank(level);
+	if (rank > 0) {
+		const attacks = actor.system.proficiencies.attacks;
+		for (const key of ["simple", "unarmed"]) {
+			if (attacks[key]) attacks[key].rank = Math.max(attacks[key].rank ?? 0, rank);
+		}
+		// Same shape the system builds for base-weapon entries (cf. setFavoredWeaponRank).
+		const bomb = attacks[ALCH_BOMB_KEY];
+		attacks[ALCH_BOMB_KEY] = {
+			...(bomb ?? {}),
+			label: bomb?.label ?? CONFIG.PF2E.baseWeaponTypes["alchemical-bomb"] ?? "Alchemical Bombs",
+			visible: true,
+			rank: Math.max(Number(bomb?.rank) || 0, rank)
+		};
+	}
+	if (level >= 7 && !_alchHasWeaponSpec(actor)) _alchPushWeaponSpec(actor, classItem);
+}
+
+// Any item already contributing the core spec modifier (the real feature at 13, or an
+// archetype grant) means we stay out of the way.
+function _alchHasWeaponSpec(actor) {
+	return actor.items.some(i => i.system.rules?.some(r => r.key === "FlatModifier" && r.slug === ALCH_SPEC_SLUG));
+}
+
+function _alchPushWeaponSpec(actor, classItem) {
+	const label = game.i18n.localize("PF2E.WeaponSpecialization");
+	for (const selector of ["weapon-damage", "unarmed-damage"]) {
+		const construct = (options = {}) => {
+			const test = options.test ? Array.from(options.test) : null;
+			// Core feature: flat +2 at expert, upgraded to 3/4 at master/legendary.
+			const rankOpt = test?.find(o => /^item:proficiency:rank:\d$/.test(o));
+			const value = Math.clamp(rankOpt ? Number(rankOpt.at(-1)) : 2, 2, 4);
+			const mod = new game.pf2e.Modifier({
+				slug: ALCH_SPEC_SLUG,
+				label,
+				modifier: value,
+				type: "untyped",
+				predicate: new game.pf2e.Predicate([{ gte: ["item:proficiency:rank", 2] }]),
+				hideIfDisabled: true,
+				source: classItem.uuid
+			});
+			if (test) mod.test(test);
+			return mod;
+		};
+		(actor.synthetics.modifiers[selector] ??= []).push(construct);
+	}
+}
+
+// Re-run data prep so the toggle takes effect without a reload.
+function _alchRefreshActors() {
+	for (const actor of game.actors) {
+		if (actor.class?.slug !== "alchemist") continue;
+		actor.reset();
+		if (actor.sheet?.rendered) actor.sheet.render();
+	}
+	for (const token of canvas?.tokens?.placeables ?? []) {
+		const actor = token.actor;
+		if (!actor || token.document.actorLink) continue; // linked ones were covered above
+		if (actor.class?.slug !== "alchemist") continue;
+		actor.reset();
+		if (actor.sheet?.rendered) actor.sheet.render();
+	}
+}
+
+registerTweak({
+	id: "alchemistMartialProgression",
+	name: "Alchemist: Martial Weapon Progression",
+	hint: "House rule. Alchemists advance simple weapons, unarmed attacks and alchemical bombs on the standard martial track: expert at 5 and master at 13 (instead of 7 and 15), and gain Weapon Specialization at 7 (instead of 13). Calculated on the fly, nothing on the character is changed, so turning it off reverts instantly. World setting (GM only), so everyone sees the same numbers.",
+	default: false,
+	scope: "world",
+	onEnable() {
+		if (_alchWrapped) return;
+		if (typeof libWrapper !== "function") {
+			console.error(`${MODULE_ID} | libWrapper is not active — the Alchemist Martial Weapon Progression tweak cannot function.`);
+			ui.notifications?.error("Sky's 2e Tweaks: the libWrapper module is required for the Alchemist Martial Weapon Progression tweak but isn't active.");
+			return;
+		}
+		libWrapper.register(MODULE_ID, ALCH_CLASS_PREP_TARGET, _alchWrapPrepareActorData, "WRAPPER");
+		_alchWrapped = true;
+		_alchRefreshActors();
+	},
+	onDisable() {
+		if (!_alchWrapped) return;
+		if (typeof libWrapper === "function") libWrapper.unregister(MODULE_ID, ALCH_CLASS_PREP_TARGET, false);
+		_alchWrapped = false;
+		_alchRefreshActors();
+	}
+});
+
+// =============================================================================
 // Core setup
 // =============================================================================
 
@@ -3239,10 +3375,15 @@ Hooks.once("init", () => {
 		game.settings.register(MODULE_ID, tweak.id, {
 			name: tweak.name,
 			hint: tweak.hint,
-			scope: "client",
+			scope: tweak.scope ?? "client",
 			config: false,
 			type: Boolean,
-			default: tweak.default ?? true
+			default: tweak.default ?? true,
+			// A world setting changes on every client at once, so each client toggles
+			// itself here; the settings form only drives client-scoped tweaks directly.
+			onChange: tweak.scope === "world"
+				? (value => value ? tweak.onEnable?.() : tweak.onDisable?.())
+				: undefined
 		});
 	}
 
@@ -3284,17 +3425,21 @@ class TweaksConfig extends FormApplication {
 			id: t.id,
 			name: t.name,
 			hint: t.hint,
-			enabled: game.settings.get(MODULE_ID, t.id)
+			enabled: game.settings.get(MODULE_ID, t.id),
+			locked: t.scope === "world" && !game.user.isGM
 		}));
 		return { tweaks };
 	}
 
 	async _updateObject(event, formData) {
 		for (const tweak of TWEAKS) {
+			const isWorld = tweak.scope === "world";
+			if (isWorld && !game.user.isGM) continue;
 			const key = `tweaks.${tweak.id}`;
 			const newVal = !!formData[key];
 			const oldVal = game.settings.get(MODULE_ID, tweak.id);
 			await game.settings.set(MODULE_ID, tweak.id, newVal);
+			if (isWorld) continue; // its setting onChange toggles it on every client
 			if (newVal && !oldVal) tweak.onEnable?.();
 			if (!newVal && oldVal) tweak.onDisable?.();
 		}
