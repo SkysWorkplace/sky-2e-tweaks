@@ -3367,6 +3367,57 @@ registerTweak({
 });
 
 // =============================================================================
+// Tweak: Placed Sound Volume Fix
+//
+// Foundry v14's SoundsLayer#_configurePlayback has an "Exactly audible" branch:
+// when the listener sits on the exact x/y/elevation of the sound source it sets
+// config.volume = 1, discarding the volume the caller passed in. Every positional
+// sound played on your own selected token hits this (the token is the listener),
+// so Sequencer placed sounds there ignore their authored volume and any
+// multiplier — e.g. Trigger Animations' volume slider (sequencer.js:10180 writes
+// `sound.volume = config.volume * volume_multiplier` straight from this result).
+//
+// Fix: when that branch is about to fire, keep the caller's volume. At distance 0
+// the source's volume multiplier is 1, so the caller's value IS the correct one.
+// =============================================================================
+
+const SPV_TARGET = "foundry.canvas.layers.SoundsLayer.prototype._configurePlayback";
+let _spvWrapped = false;
+
+function _spvWrapConfigurePlayback(wrapped, config) {
+	const { listener, source } = config;
+	const exact = !!listener && !!source
+		&& (listener.x === source.x) && (listener.y === source.y)
+		&& (listener.elevation === source.elevation);
+	const requested = config.volume;
+	const result = wrapped(config);
+	if (exact) config.volume = requested;
+	return result;
+}
+
+registerTweak({
+	id: "placedSoundVolumeFix",
+	name: "Placed Sound Volume Fix",
+	hint: "Fixes a Foundry bug where a positional sound played exactly on your listening token (e.g. a Sequencer / Trigger Animations buff on yourself) always plays at full volume, ignoring its own volume and the Trigger Animations volume slider.",
+	default: true,
+	onEnable() {
+		if (_spvWrapped) return;
+		if (typeof libWrapper !== "function") {
+			console.error(`${MODULE_ID} | libWrapper is not active — the Placed Sound Volume Fix tweak cannot function.`);
+			ui.notifications?.error("Sky's 2e Tweaks: the libWrapper module is required for the Placed Sound Volume Fix tweak but isn't active.");
+			return;
+		}
+		libWrapper.register(MODULE_ID, SPV_TARGET, _spvWrapConfigurePlayback, "WRAPPER");
+		_spvWrapped = true;
+	},
+	onDisable() {
+		if (!_spvWrapped) return;
+		if (typeof libWrapper === "function") libWrapper.unregister(MODULE_ID, SPV_TARGET, false);
+		_spvWrapped = false;
+	}
+});
+
+// =============================================================================
 // Core setup
 // =============================================================================
 
